@@ -1,0 +1,11 @@
+{
+	"required": true,
+	"package": "dev.mearth.earth.client.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"client": [
+		"ClientWorldPropertiesMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

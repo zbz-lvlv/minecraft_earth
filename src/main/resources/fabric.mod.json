@@ -1,0 +1,33 @@
+{
+	"schemaVersion": 1,
+	"id": "earthmod",
+	"version": "${version}",
+	"name": "Earth World",
+	"description": "Adds an Earth world preset powered by real-world terrain data and a /geotp command.",
+	"authors": [
+		"OpenAI"
+	],
+	"contact": {
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/earthmod/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"dev.mearth.earth.EarthMod"
+		]
+	},
+	"mixins": [
+		{
+			"config": "earthmod.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.2",
+		"minecraft": "~1.21",
+		"java": ">=21",
+		"fabric-api": "*"
+	}
+}

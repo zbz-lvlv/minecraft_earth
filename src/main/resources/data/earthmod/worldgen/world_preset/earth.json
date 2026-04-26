@@ -1,0 +1,39 @@
+{
+	"dimensions": {
+		"minecraft:overworld": {
+			"type": "earthmod:earth_overworld",
+			"generator": {
+				"type": "earthmod:earth",
+				"biome_source": {
+					"type": "minecraft:fixed",
+					"biome": "minecraft:plains"
+				},
+				"meters_per_block": 25.0,
+				"min_y": -512,
+				"world_height": 1024,
+				"sea_level": 0
+			}
+		},
+		"minecraft:the_nether": {
+			"type": "minecraft:the_nether",
+			"generator": {
+				"type": "minecraft:noise",
+				"settings": "minecraft:nether",
+				"biome_source": {
+					"type": "minecraft:multi_noise",
+					"preset": "minecraft:nether"
+				}
+			}
+		},
+		"minecraft:the_end": {
+			"type": "minecraft:the_end",
+			"generator": {
+				"type": "minecraft:noise",
+				"settings": "minecraft:end",
+				"biome_source": {
+					"type": "minecraft:the_end"
+				}
+			}
+		}
+	}
+}
