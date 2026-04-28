@@ -3,6 +3,7 @@ package dev.mearth.earth.world;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.MapCodec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
+import dev.mearth.earth.climate.EarthClimateService;
 import dev.mearth.earth.config.EarthConfig;
 import dev.mearth.earth.geo.EarthProjection;
 import dev.mearth.earth.terrain.TerrainTileService;
@@ -30,6 +31,9 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 public final class EarthChunkGenerator extends ChunkGenerator {
+	private static final int CLIMATE_START_YEAR = 2010;
+	private static final int CLIMATE_END_YEAR = 2020;
+	private static final int WORLD_Y_SHIFT = -40;
 	public static final MapCodec<EarthChunkGenerator> CODEC = RecordCodecBuilder.mapCodec(instance -> instance.group(
 		BiomeSource.CODEC.fieldOf("biome_source").forGetter(generator -> generator.biomeSource),
 		Codec.DOUBLE.optionalFieldOf("meters_per_block", 25.0).forGetter(EarthChunkGenerator::metersPerBlock),
@@ -40,10 +44,19 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 
 	private static final BlockState AIR = Blocks.AIR.getDefaultState();
 	private static final BlockState STONE = Blocks.STONE.getDefaultState();
-	private static final BlockState DIRT = Blocks.DIRT.getDefaultState();
-	private static final BlockState GRASS = Blocks.GRASS_BLOCK.getDefaultState();
-	private static final BlockState SAND = Blocks.SAND.getDefaultState();
 	private static final BlockState WATER = Blocks.WATER.getDefaultState();
+	private static final BlockState[] PLANT_GROWTH_SURFACE_BLOCKS = new BlockState[] {
+		Blocks.RED_CONCRETE.getDefaultState(),
+		Blocks.ORANGE_CONCRETE.getDefaultState(),
+		Blocks.YELLOW_CONCRETE.getDefaultState(),
+		Blocks.LIME_CONCRETE.getDefaultState(),
+		Blocks.GREEN_CONCRETE.getDefaultState(),
+		Blocks.CYAN_CONCRETE.getDefaultState(),
+		Blocks.LIGHT_BLUE_CONCRETE.getDefaultState(),
+		Blocks.BLUE_CONCRETE.getDefaultState(),
+		Blocks.MAGENTA_CONCRETE.getDefaultState(),
+		Blocks.PINK_CONCRETE.getDefaultState()
+	};
 	private final double metersPerBlock;
 	private final int minY;
 	private final int worldHeight;
@@ -59,6 +72,14 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 
 	public double metersPerBlock() {
 		return this.metersPerBlock;
+	}
+
+	public double eastWestMetersPerBlock() {
+		return effectiveMetersPerBlock() * 30.0 / 25.0;
+	}
+
+	public double northSouthMetersPerBlock() {
+		return effectiveMetersPerBlock();
 	}
 
 	@Override
@@ -110,15 +131,16 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 			for (int localZ = 0; localZ < 16; localZ++) {
 				int worldX = chunkStartX + localX;
 				int worldZ = chunkStartZ + localZ;
-				int surfaceY = getSurfaceY(worldX, worldZ, maxY);
+				SurfaceColumn surface = getSurfaceColumn(worldX, worldZ, maxY);
+				int surfaceY = surface.surfaceY();
 
 				for (int y = this.minY; y <= surfaceY; y++) {
 					mutable.set(worldX, y, worldZ);
-					chunk.setBlockState(mutable, pickGroundBlock(y, surfaceY), false);
+					chunk.setBlockState(mutable, pickGroundBlock(y, surfaceY, surface.surfaceBlock()), false);
 				}
 
-				if (surfaceY < this.seaLevel) {
-					for (int y = surfaceY + 1; y <= this.seaLevel && y <= maxY; y++) {
+				if (surfaceY < shiftedSeaLevel()) {
+					for (int y = surfaceY + 1; y <= shiftedSeaLevel() && y <= maxY; y++) {
 						mutable.set(worldX, y, worldZ);
 						chunk.setBlockState(mutable, WATER, false);
 					}
@@ -131,19 +153,20 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 
 	@Override
 	public int getHeight(int x, int z, Heightmap.Type heightmap, HeightLimitView world, NoiseConfig noiseConfig) {
-		return getSurfaceY(x, z, this.minY + this.worldHeight - 1) + 1;
+		return getSurfaceColumn(x, z, this.minY + this.worldHeight - 1).surfaceY() + 1;
 	}
 
 	@Override
 	public VerticalBlockSample getColumnSample(int x, int z, HeightLimitView world, NoiseConfig noiseConfig) {
 		BlockState[] states = new BlockState[this.worldHeight];
-		int surfaceY = getSurfaceY(x, z, this.minY + this.worldHeight - 1);
+		SurfaceColumn surface = getSurfaceColumn(x, z, this.minY + this.worldHeight - 1);
+		int surfaceY = surface.surfaceY();
 
 		for (int index = 0; index < states.length; index++) {
 			int y = this.minY + index;
 			if (y <= surfaceY) {
-				states[index] = pickGroundBlock(y, surfaceY);
-			} else if (y <= this.seaLevel) {
+				states[index] = pickGroundBlock(y, surfaceY, surface.surfaceBlock());
+			} else if (y <= shiftedSeaLevel()) {
 				states[index] = WATER;
 			} else {
 				states[index] = AIR;
@@ -155,10 +178,12 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 
 	@Override
 	public void getDebugHudText(List<String> text, NoiseConfig noiseConfig, BlockPos pos) {
-		double metersPerBlock = effectiveMetersPerBlock();
-		double latitude = EarthProjection.blockZToLatitude(pos.getZ(), metersPerBlock);
-		double longitude = EarthProjection.blockXToLongitude(pos.getX(), metersPerBlock);
-		double equivalentAltitudeMeters = pos.getY() * metersPerBlock;
+		double eastWestMetersPerBlock = eastWestMetersPerBlock();
+		double northSouthMetersPerBlock = northSouthMetersPerBlock();
+		double verticalMetersPerBlock = effectiveMetersPerBlock();
+		double latitude = EarthProjection.blockZToLatitude(pos.getZ(), northSouthMetersPerBlock);
+		double longitude = EarthProjection.blockXToLongitude(pos.getX(), eastWestMetersPerBlock);
+		double equivalentAltitudeMeters = (pos.getY() - WORLD_Y_SHIFT) * verticalMetersPerBlock;
 		double groundAltitudeMeters = TerrainTileService.sampleMeters(latitude, longitude);
 		text.add(
 			"Earth lat/lon/alt: %.5f, %.5f, %.0f m (ground: %.0f m)".formatted(
@@ -168,7 +193,15 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 				groundAltitudeMeters
 			)
 		);
-		text.add("Earth scale: 1 block = %.1f m".formatted(metersPerBlock));
+		text.add(
+			"Earth scale: E/W 1:%.1f m, N/S 1:%.1f m, Y 1:%.1f m".formatted(
+				eastWestMetersPerBlock,
+				northSouthMetersPerBlock,
+				verticalMetersPerBlock
+			)
+		);
+		addEffectiveClimateDebugText(text, latitude, longitude, equivalentAltitudeMeters, groundAltitudeMeters);
+		addClimateDebugText(text, latitude, longitude);
 	}
 
 	@Override
@@ -183,21 +216,23 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 
 	@Override
 	public int getSeaLevel() {
-		return this.seaLevel;
+		return shiftedSeaLevel();
 	}
 
 	@Override
 	public int getSpawnHeight(HeightLimitView world) {
-		return this.seaLevel + 1;
+		return shiftedSeaLevel() + 1;
 	}
 
-	private int getSurfaceY(int blockX, int blockZ, int maxY) {
+	private SurfaceColumn getSurfaceColumn(int blockX, int blockZ, int maxY) {
+		double latitude = EarthProjection.blockZToLatitude(blockZ, northSouthMetersPerBlock());
+		double longitude = EarthProjection.blockXToLongitude(blockX, eastWestMetersPerBlock());
 		double metersPerBlock = effectiveMetersPerBlock();
-		double latitude = EarthProjection.blockZToLatitude(blockZ, metersPerBlock);
-		double longitude = EarthProjection.blockXToLongitude(blockX, metersPerBlock);
 		double elevationMeters = TerrainTileService.sampleMeters(latitude, longitude);
-		int y = (int)Math.round(elevationMeters / metersPerBlock) - 1;
-		return Math.max(this.minY, Math.min(maxY, y));
+		int y = (int)Math.round(elevationMeters / metersPerBlock) - 1 + WORLD_Y_SHIFT;
+		int surfaceY = Math.max(this.minY, Math.min(maxY, y));
+		BlockState surfaceBlock = pickRainfallSurfaceBlock(latitude, longitude, elevationMeters);
+		return new SurfaceColumn(surfaceY, surfaceBlock);
 	}
 
 	private double effectiveMetersPerBlock() {
@@ -205,16 +240,128 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		return configured > 0.0 ? configured : this.metersPerBlock;
 	}
 
-	private BlockState pickGroundBlock(int y, int surfaceY) {
-		if (surfaceY <= this.seaLevel && y >= surfaceY - 3) {
-			return SAND;
+	private int shiftedSeaLevel() {
+		return this.seaLevel + WORLD_Y_SHIFT;
+	}
+
+	private void addClimateDebugText(List<String> text, double latitude, double longitude) {
+		double southLatitude = Math.floor(latitude);
+		double northLatitude = Math.ceil(latitude);
+		double westLongitude = Math.floor(longitude);
+		double eastLongitude = Math.ceil(longitude);
+
+		text.add("Earth climate corners (%d-%d):".formatted(CLIMATE_START_YEAR, CLIMATE_END_YEAR));
+		text.add(formatClimateCorner("NW", northLatitude, westLongitude));
+		text.add(formatClimateCorner("NE", northLatitude, eastLongitude));
+		text.add(formatClimateCorner("SW", southLatitude, westLongitude));
+		text.add(formatClimateCorner("SE", southLatitude, eastLongitude));
+	}
+
+	private void addEffectiveClimateDebugText(
+		List<String> text,
+		double latitude,
+		double longitude,
+		double altitudeMeters,
+		double groundAltitudeMeters
+	) {
+		EarthClimateService.EffectiveClimate climate = EarthClimateService.getEffectiveCachedOrFetchAsync(
+			latitude,
+			longitude,
+			altitudeMeters,
+			CLIMATE_START_YEAR,
+			CLIMATE_END_YEAR
+		);
+		EarthClimateService.EffectiveClimate groundClimate = EarthClimateService.getEffectiveCachedOrFetchAsync(
+			latitude,
+			longitude,
+			groundAltitudeMeters,
+			CLIMATE_START_YEAR,
+			CLIMATE_END_YEAR
+		);
+		if (climate == null) {
+			text.add("Earth climate point: loading...");
+			return;
 		}
-		if (y == surfaceY) {
-			return surfaceY > this.seaLevel ? GRASS : SAND;
+		String growthText = groundClimate != null ? "%.2f".formatted(groundClimate.plantGrowthScore()) : "loading";
+		text.add(
+			"Earth climate point: temp %.1f C | rain %.2f mm/day | growth %s | ref alt %.0f m".formatted(
+				climate.averageTemperature(),
+				climate.averageRainfall(),
+				growthText,
+				climate.referenceAltitude()
+			)
+		);
+		text.add(
+			"Earth climate terrain: slopeForClimate %.3f (%.1f deg) | uphill aspect %.1f deg | windward %.2f | oro x%.2f".formatted(
+				climate.slopeForClimate(),
+				climate.slopeDegrees(),
+				climate.aspectDegrees(),
+				climate.windwardness(),
+				climate.orographicMultiplier()
+			)
+		);
+		text.add(
+			"Earth climate vectors: moisture flow(E %.2f, N %.2f) | source %.1f deg | uphill(E %.2f, N %.2f)".formatted(
+				climate.moistureVectorEast(),
+				climate.moistureVectorNorth(),
+				climate.moistureSourceDegrees(),
+				climate.uphillVectorEast(),
+				climate.uphillVectorNorth()
+			)
+		);
+	}
+
+	private String formatClimateCorner(String label, double latitude, double longitude) {
+		EarthClimateService.ClimateSummary climate = EarthClimateService.getCachedOrFetchAsync(
+			latitude,
+			longitude,
+			CLIMATE_START_YEAR,
+			CLIMATE_END_YEAR
+		);
+		if (climate == null) {
+			return "%s %.1f, %.1f | climate loading...".formatted(label, latitude, longitude);
 		}
-		if (y >= surfaceY - 3) {
-			return DIRT;
+		return "%s %.1f, %.1f | temp %.1f C | rain %.2f mm/day | alt %.0f m".formatted(
+			label,
+			climate.latitude(),
+			climate.longitude(),
+			climate.averageTemperature(),
+			climate.averageRainfall(),
+			climate.altitude()
+		);
+	}
+
+	private BlockState pickGroundBlock(int y, int surfaceY, BlockState surfaceBlock) {
+		if (y >= surfaceY - 2) {
+			return surfaceBlock;
 		}
 		return STONE;
+	}
+
+	private BlockState pickRainfallSurfaceBlock(double latitude, double longitude, double elevationMeters) {
+		try {
+			EarthClimateService.EffectiveClimate climate = EarthClimateService.sampleEffective(
+				latitude,
+				longitude,
+				elevationMeters,
+				CLIMATE_START_YEAR,
+				CLIMATE_END_YEAR
+			);
+			double normalized = climate.plantGrowthScore();
+			int index = Math.min(
+				PLANT_GROWTH_SURFACE_BLOCKS.length - 1,
+				(int)Math.round(normalized * (PLANT_GROWTH_SURFACE_BLOCKS.length - 1))
+			);
+			return PLANT_GROWTH_SURFACE_BLOCKS[index];
+		} catch (Exception exception) {
+			return Blocks.GRAY_CONCRETE.getDefaultState();
+		}
+	}
+
+	private double clamp(double value, double min, double max) {
+		return Math.max(min, Math.min(max, value));
+	}
+
+	private record SurfaceColumn(int surfaceY, BlockState surfaceBlock) {
 	}
 }

@@ -16,6 +16,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class TerrainTileService {
 	private static final double MAX_LAT = 85.05112878;
+	private static final double RAW_ALTITUDE_OFFSET_METERS = 10.0;
 	private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 	private static final Map<TileKey, BufferedImage> TILE_CACHE = new ConcurrentHashMap<>();
 
@@ -49,7 +50,7 @@ public final class TerrainTileService {
 
 			double top = lerp(e00, e10, fracX);
 			double bottom = lerp(e01, e11, fracX);
-			return lerp(top, bottom, fracY);
+			return lerp(top, bottom, fracY) + RAW_ALTITUDE_OFFSET_METERS;
 		} catch (Exception exception) {
 			EarthMod.LOGGER.warn("Terrain fetch failed at {}, {}: {}", latitude, longitude, exception.toString());
 			return 0.0;

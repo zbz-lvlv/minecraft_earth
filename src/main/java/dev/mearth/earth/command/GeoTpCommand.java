@@ -53,8 +53,8 @@ public final class GeoTpCommand {
 					return;
 				}
 
-				double x = EarthProjection.longitudeToBlockX(result.longitude(), generator.metersPerBlock());
-				double z = EarthProjection.latitudeToBlockZ(result.latitude(), generator.metersPerBlock());
+				double x = EarthProjection.longitudeToBlockX(result.longitude(), generator.eastWestMetersPerBlock());
+				double z = EarthProjection.latitudeToBlockZ(result.latitude(), generator.northSouthMetersPerBlock());
 				int blockX = MathHelper.floor(x);
 				int blockZ = MathHelper.floor(z);
 				int y = TELEPORT_Y;

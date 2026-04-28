@@ -65,6 +65,10 @@ public final class EarthConfig {
 		return data.nominatimEndpoint;
 	}
 
+	public static String nasaPowerMonthlyEndpoint() {
+		return data.nasaPowerMonthlyEndpoint;
+	}
+
 	public static final class Data {
 		public double metersPerBlock = 25.0;
 		public int seaLevel = 0;
@@ -72,5 +76,6 @@ public final class EarthConfig {
 		public int worldHeight = 1024;
 		public int terrainZoom = 13;
 		public String nominatimEndpoint = "https://nominatim.openstreetmap.org/search";
+		public String nasaPowerMonthlyEndpoint = "https://power.larc.nasa.gov/api/temporal/monthly/point";
 	}
 }
