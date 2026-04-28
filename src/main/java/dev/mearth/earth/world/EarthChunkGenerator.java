@@ -155,10 +155,20 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 
 	@Override
 	public void getDebugHudText(List<String> text, NoiseConfig noiseConfig, BlockPos pos) {
-		double latitude = EarthProjection.blockZToLatitude(pos.getZ(), effectiveMetersPerBlock());
-		double longitude = EarthProjection.blockXToLongitude(pos.getX(), effectiveMetersPerBlock());
-		text.add("Earth lat/lon: %.5f, %.5f".formatted(latitude, longitude));
-		text.add("Earth scale: 1 block = %.1f m".formatted(effectiveMetersPerBlock()));
+		double metersPerBlock = effectiveMetersPerBlock();
+		double latitude = EarthProjection.blockZToLatitude(pos.getZ(), metersPerBlock);
+		double longitude = EarthProjection.blockXToLongitude(pos.getX(), metersPerBlock);
+		double equivalentAltitudeMeters = pos.getY() * metersPerBlock;
+		double groundAltitudeMeters = TerrainTileService.sampleMeters(latitude, longitude);
+		text.add(
+			"Earth lat/lon/alt: %.5f, %.5f, %.0f m (ground: %.0f m)".formatted(
+				latitude,
+				longitude,
+				equivalentAltitudeMeters,
+				groundAltitudeMeters
+			)
+		);
+		text.add("Earth scale: 1 block = %.1f m".formatted(metersPerBlock));
 	}
 
 	@Override
