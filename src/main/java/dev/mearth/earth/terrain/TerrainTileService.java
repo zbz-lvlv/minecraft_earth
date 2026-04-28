@@ -16,7 +16,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class TerrainTileService {
 	private static final double MAX_LAT = 85.05112878;
-	private static final double RAW_ALTITUDE_OFFSET_METERS = 10.0;
+	private static final double RAW_ALTITUDE_OFFSET_METERS = 12.0;
 	private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 	private static final Map<TileKey, BufferedImage> TILE_CACHE = new ConcurrentHashMap<>();
 

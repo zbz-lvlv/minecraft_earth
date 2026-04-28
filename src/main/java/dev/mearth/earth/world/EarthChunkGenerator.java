@@ -278,19 +278,23 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 			CLIMATE_START_YEAR,
 			CLIMATE_END_YEAR
 		);
-		if (climate == null) {
+		if (groundClimate == null) {
 			text.add("Earth climate point: loading...");
 			return;
 		}
-		String growthText = groundClimate != null ? "%.2f".formatted(groundClimate.plantGrowthScore()) : "loading";
 		text.add(
 			"Earth climate point: temp %.1f C | rain %.2f mm/day | growth %s | ref alt %.0f m".formatted(
-				climate.averageTemperature(),
-				climate.averageRainfall(),
-				growthText,
-				climate.referenceAltitude()
+				groundClimate.averageTemperature(),
+				groundClimate.averageRainfall(),
+				"%.2f".formatted(groundClimate.plantGrowthScore()),
+				groundClimate.referenceAltitude()
 			)
 		);
+		if (climate == null) {
+			text.add("Earth climate terrain: loading...");
+			text.add("Earth climate vectors: loading...");
+			return;
+		}
 		text.add(
 			"Earth climate terrain: slopeForClimate %.3f (%.1f deg) | uphill aspect %.1f deg | windward %.2f | oro x%.2f".formatted(
 				climate.slopeForClimate(),

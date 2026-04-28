@@ -38,7 +38,7 @@ public final class EarthClimateService {
 	public static final String PRECIPITATION = "PRECTOTCORR";
 	private static final double ENVIRONMENTAL_LAPSE_RATE_C_PER_KM = 6.5;
 	private static final double EARTH_RADIUS_METERS = 6_378_137.0;
-	private static final double CLIMATE_SLOPE_SAMPLE_DISTANCE_METERS = 1000.0;
+	private static final double CLIMATE_SLOPE_SAMPLE_DISTANCE_METERS = 2000.0;
 	private static final double RAINFALL_SLOPE_INFLUENCE = 1.0; // increase to make steeper terrain change rainfall more
 	private static final double RAINFALL_ASPECT_INFLUENCE = 0.5; // increase to make windward/leeward aspect matter more
 	private static final double MAX_OROGRAPHIC_MULTIPLIER = 4.0;
