@@ -36,14 +36,16 @@ public final class EarthClimateService {
 	public static final String TEMPERATURE_2M_MAX = "T2M_MAX";
 	public static final String TEMPERATURE_2M_MIN = "T2M_MIN";
 	public static final String PRECIPITATION = "PRECTOTCORR";
+	public static final String WIND_SPEED_2M = "WS2M";
+	public static final String WIND_DIRECTION_2M = "WD2M";
 	private static final double ENVIRONMENTAL_LAPSE_RATE_C_PER_KM = 6.5;
 	private static final double EARTH_RADIUS_METERS = 6_378_137.0;
-	private static final double CLIMATE_SLOPE_SAMPLE_DISTANCE_METERS = 2000.0;
+	private static final double CLIMATE_SLOPE_SAMPLE_DISTANCE_METERS = 5000.0;
 	private static final double RAINFALL_SLOPE_INFLUENCE = 1.0; // increase to make steeper terrain change rainfall more
-	private static final double RAINFALL_ASPECT_INFLUENCE = 0.5; // increase to make windward/leeward aspect matter more
+	private static final double RAINFALL_ASPECT_INFLUENCE = 2.0; // increase to make windward/leeward aspect matter more
 	private static final double MAX_OROGRAPHIC_MULTIPLIER = 4.0;
 	private static final double MIN_OROGRAPHIC_MULTIPLIER = 0.25;
-	private static final double MOISTURE_GRADIENT_STRONG_MM_PER_DAY = 0.35;
+	private static final double MOISTURE_FLOW_STRONG_MPS = 4.0;
 	private static final double BASE_SLOPE_FOR_CLIMATE_STRONG_GRADE = 0.25;
 	private static final double BASE_OROGRAPHIC_RESPONSE_STRENGTH = 0.6;
 	private static final double LEEWARD_RESPONSE_FACTOR = 0.5; // lower values reduce drying on leeward slopes
@@ -51,8 +53,6 @@ public final class EarthClimateService {
 	private static final double PLANT_TEMP_COOL_SIGMA_C = 12.0;
 	private static final double PLANT_TEMP_HOT_SIGMA_C = 9.0;
 	private static final double PLANT_RAIN_HALF_SAT_MM_PER_DAY = 1.5;
-	private static final double PLANT_RAIN_OPTIMAL_MM_PER_DAY = 6.0;
-	private static final double PLANT_RAIN_EXCESS_MM_PER_DAY = 14.0;
 	private static final double PLANT_LIMITING_FACTOR_FLOOR = 0.35;
 
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
@@ -60,6 +60,7 @@ public final class EarthClimateService {
 	private static final Map<ClimateRequestKey, ClimateSummary> CACHE = new ConcurrentHashMap<>();
 	private static final Map<ClimateRequestKey, CompletableFuture<ClimateSummary>> IN_FLIGHT = new ConcurrentHashMap<>();
 	private static final Path CACHE_DIR = FabricLoader.getInstance().getConfigDir().resolve("earthmod").resolve("climate");
+	private static final String CACHE_VERSION = "v2";
 	private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(2, runnable -> {
 		Thread thread = new Thread(runnable, "earthmod-climate");
 		thread.setDaemon(true);
@@ -72,7 +73,9 @@ public final class EarthClimateService {
 	public static ClimateSummary sample(double latitude, double longitude, int startYear, int endYear) throws IOException, InterruptedException {
 		return sample(latitude, longitude, startYear, endYear, List.of(
 			TEMPERATURE_2M,
-			PRECIPITATION
+			PRECIPITATION,
+			WIND_SPEED_2M,
+			WIND_DIRECTION_2M
 		));
 	}
 
@@ -103,7 +106,13 @@ public final class EarthClimateService {
 	}
 
 	public static ClimateSummary getCachedOrFetchAsync(double latitude, double longitude, int startYear, int endYear) {
-		ClimateRequestKey key = createRequestKey(latitude, longitude, startYear, endYear, List.of(TEMPERATURE_2M, PRECIPITATION));
+		ClimateRequestKey key = createRequestKey(
+			latitude,
+			longitude,
+			startYear,
+			endYear,
+			List.of(TEMPERATURE_2M, PRECIPITATION, WIND_SPEED_2M, WIND_DIRECTION_2M)
+		);
 		return getCachedOrFetchAsync(key);
 	}
 
@@ -221,10 +230,10 @@ public final class EarthClimateService {
 			latitudeFraction
 		);
 		Vector2 moistureFlowVector = moistureFlowVector(
-			southWest.averageRainfall(),
-			southEast.averageRainfall(),
-			northWest.averageRainfall(),
-			northEast.averageRainfall(),
+			southWest,
+			southEast,
+			northWest,
+			northEast,
 			longitudeFraction,
 			latitudeFraction
 		);
@@ -232,7 +241,7 @@ public final class EarthClimateService {
 		double altitudeDeltaMeters = altitudeMeters - interpolatedReferenceAltitude;
 		double adjustedTemperature = interpolatedTemperature - altitudeDeltaMeters * ENVIRONMENTAL_LAPSE_RATE_C_PER_KM / 1000.0;
 		double windwardness = dot(moistureFlowVector, terrainGradient.uphillUnitVector());
-		double moistureStrength = clamp(moistureFlowVector.magnitude() / MOISTURE_GRADIENT_STRONG_MM_PER_DAY, 0.0, 1.5);
+		double moistureStrength = clamp(moistureFlowVector.magnitude() / MOISTURE_FLOW_STRONG_MPS, 0.0, 1.5);
 		double slopeStrength = clamp(
 			terrainGradient.slopeForClimate() / BASE_SLOPE_FOR_CLIMATE_STRONG_GRADE * RAINFALL_SLOPE_INFLUENCE,
 			0.0,
@@ -342,15 +351,28 @@ public final class EarthClimateService {
 		JsonObject parameterObject = getObject(properties, "parameter");
 		JsonObject temperatureValues = getObject(parameterObject, TEMPERATURE_2M);
 		JsonObject rainfallValues = getObject(parameterObject, PRECIPITATION);
+		JsonObject windSpeedValues = getObject(parameterObject, WIND_SPEED_2M);
+		JsonObject windDirectionValues = getObject(parameterObject, WIND_DIRECTION_2M);
 		double averageTemperature = averageAnnualValues(temperatureValues, key.startYear(), key.endYear(), TEMPERATURE_2M);
 		double averageRainfall = averageAnnualValues(rainfallValues, key.startYear(), key.endYear(), PRECIPITATION);
+		List<Double> averageMonthlyRainfall = averageMonthlyValues(rainfallValues, key.startYear(), key.endYear(), PRECIPITATION);
+		List<Double> averageMonthlyWindSpeed = averageMonthlyValues(windSpeedValues, key.startYear(), key.endYear(), WIND_SPEED_2M);
+		List<Double> averageMonthlyWindDirection = averageMonthlyDirectionValues(
+			windDirectionValues,
+			key.startYear(),
+			key.endYear(),
+			WIND_DIRECTION_2M
+		);
 
 		return new ClimateSummary(
 			key.latitude(),
 			key.longitude(),
 			altitude,
 			averageTemperature,
-			averageRainfall
+			averageRainfall,
+			averageMonthlyRainfall,
+			averageMonthlyWindSpeed,
+			averageMonthlyWindDirection
 		);
 	}
 
@@ -392,6 +414,69 @@ public final class EarthClimateService {
 		return total / count;
 	}
 
+	private static List<Double> averageMonthlyValues(JsonObject valuesObject, int startYear, int endYear, String parameterName) throws IOException {
+		Double[] monthlyAverages = new Double[12];
+		for (int month = 1; month <= 12; month++) {
+			double total = 0.0;
+			int count = 0;
+			for (int year = startYear; year <= endYear; year++) {
+				Double value = readMonthlyValue(valuesObject, year, month);
+				if (value == null) {
+					continue;
+				}
+				total += value;
+				count++;
+			}
+			if (count == 0) {
+				throw new IOException("No monthly climate values found for parameter '" + parameterName + "' month " + month);
+			}
+			monthlyAverages[month - 1] = total / count;
+		}
+		return List.of(monthlyAverages);
+	}
+
+	private static List<Double> averageMonthlyDirectionValues(
+		JsonObject valuesObject,
+		int startYear,
+		int endYear,
+		String parameterName
+	) throws IOException {
+		Double[] monthlyAverages = new Double[12];
+		for (int month = 1; month <= 12; month++) {
+			double sinTotal = 0.0;
+			double cosTotal = 0.0;
+			int count = 0;
+			for (int year = startYear; year <= endYear; year++) {
+				Double value = readMonthlyValue(valuesObject, year, month);
+				if (value == null) {
+					continue;
+				}
+				double radians = Math.toRadians(value);
+				sinTotal += Math.sin(radians);
+				cosTotal += Math.cos(radians);
+				count++;
+			}
+			if (count == 0) {
+				throw new IOException("No monthly climate values found for parameter '" + parameterName + "' month " + month);
+			}
+			monthlyAverages[month - 1] = normalizeDegrees(Math.toDegrees(Math.atan2(sinTotal / count, cosTotal / count)));
+		}
+		return List.of(monthlyAverages);
+	}
+
+	private static Double readMonthlyValue(JsonObject valuesObject, int year, int month) {
+		String monthlyKey = "%d%02d".formatted(year, month);
+		JsonElement valueElement = valuesObject.get(monthlyKey);
+		if (valueElement == null || !valueElement.isJsonPrimitive()) {
+			return null;
+		}
+		double value = valueElement.getAsDouble();
+		if (Double.isNaN(value) || value <= -999.0) {
+			return null;
+		}
+		return value;
+	}
+
 	private static ClimateSummary readCacheFile(ClimateRequestKey key) {
 		Path path = cachePath(key);
 		if (!Files.exists(path)) {
@@ -421,11 +506,13 @@ public final class EarthClimateService {
 
 	private static Path cachePath(ClimateRequestKey key) {
 		return CACHE_DIR.resolve(
-			"%s_%s_%d_%d.json".formatted(
+			"%s_%s_%d_%d_%s_%s.json".formatted(
 				formatCoordinateKey(key.latitudeKey()),
 				formatCoordinateKey(key.longitudeKey()),
 				key.startYear(),
-				key.endYear()
+				key.endYear(),
+				formatParameterKey(key.parameters()),
+				CACHE_VERSION
 			)
 		);
 	}
@@ -450,21 +537,65 @@ public final class EarthClimateService {
 		return (int)Math.round(normalized);
 	}
 
+	private static String formatParameterKey(List<String> parameters) {
+		return String.join("-", parameters).replace(',', '-');
+	}
+
 	private static double keyToCoordinate(int coordinateKey) {
 		return coordinateKey;
 	}
 
 	private static Vector2 moistureFlowVector(
-		double southWest,
-		double southEast,
-		double northWest,
-		double northEast,
+		ClimateSummary southWest,
+		ClimateSummary southEast,
+		ClimateSummary northWest,
+		ClimateSummary northEast,
 		double xFraction,
 		double yFraction
 	) {
-		double eastWestGradient = lerp(southEast - southWest, northEast - northWest, yFraction);
-		double northSouthGradient = lerp(northWest - southWest, northEast - southEast, xFraction);
-		return new Vector2(-eastWestGradient, -northSouthGradient);
+		double weightedEast = 0.0;
+		double weightedNorth = 0.0;
+		double totalWeight = 0.0;
+
+		for (int monthIndex = 0; monthIndex < 12; monthIndex++) {
+			double monthlyRainfall = bilerp(
+				southWest.averageMonthlyRainfall().get(monthIndex),
+				southEast.averageMonthlyRainfall().get(monthIndex),
+				northWest.averageMonthlyRainfall().get(monthIndex),
+				northEast.averageMonthlyRainfall().get(monthIndex),
+				xFraction,
+				yFraction
+			);
+			if (monthlyRainfall <= 0.0) {
+				continue;
+			}
+
+			double monthlyWindSpeed = bilerp(
+				southWest.averageMonthlyWindSpeed().get(monthIndex),
+				southEast.averageMonthlyWindSpeed().get(monthIndex),
+				northWest.averageMonthlyWindSpeed().get(monthIndex),
+				northEast.averageMonthlyWindSpeed().get(monthIndex),
+				xFraction,
+				yFraction
+			);
+			double monthlyWindDirection = bilerpAngleDegrees(
+				southWest.averageMonthlyWindDirection().get(monthIndex),
+				southEast.averageMonthlyWindDirection().get(monthIndex),
+				northWest.averageMonthlyWindDirection().get(monthIndex),
+				northEast.averageMonthlyWindDirection().get(monthIndex),
+				xFraction,
+				yFraction
+			);
+			Vector2 monthlyFlowVector = windFlowVector(monthlyWindSpeed, monthlyWindDirection);
+			weightedEast += monthlyFlowVector.x() * monthlyRainfall;
+			weightedNorth += monthlyFlowVector.y() * monthlyRainfall;
+			totalWeight += monthlyRainfall;
+		}
+
+		if (totalWeight <= 1.0e-9) {
+			return new Vector2(0.0, 0.0);
+		}
+		return new Vector2(weightedEast / totalWeight, weightedNorth / totalWeight);
 	}
 
 	private static TerrainGradient sampleTerrainGradient(double latitude, double longitude) {
@@ -506,6 +637,23 @@ public final class EarthClimateService {
 		return lerp(south, north, yFraction);
 	}
 
+	private static double bilerpAngleDegrees(
+		double southWest,
+		double southEast,
+		double northWest,
+		double northEast,
+		double xFraction,
+		double yFraction
+	) {
+		Vector2 south = lerpUnitVector(directionUnitVector(southWest), directionUnitVector(southEast), xFraction);
+		Vector2 north = lerpUnitVector(directionUnitVector(northWest), directionUnitVector(northEast), xFraction);
+		Vector2 blended = lerpUnitVector(south, north, yFraction);
+		if (blended.magnitude() < 1.0e-9) {
+			return 0.0;
+		}
+		return normalizeDegrees(Math.toDegrees(Math.atan2(blended.x(), blended.y())));
+	}
+
 	private static double lerp(double start, double end, double delta) {
 		return start + (end - start) * delta;
 	}
@@ -538,19 +686,18 @@ public final class EarthClimateService {
 	private static double rainfallPlantSuitability(double rainfallMmPerDay) {
 		double positiveRainfall = Math.max(0.0, rainfallMmPerDay);
 		double moistureAvailability = positiveRainfall / (positiveRainfall + PLANT_RAIN_HALF_SAT_MM_PER_DAY);
-		double excessPenalty;
-		if (positiveRainfall <= PLANT_RAIN_OPTIMAL_MM_PER_DAY) {
-			excessPenalty = 1.0;
-		} else {
-			double excess = positiveRainfall - PLANT_RAIN_OPTIMAL_MM_PER_DAY;
-			double scale = Math.max(1.0, PLANT_RAIN_EXCESS_MM_PER_DAY - PLANT_RAIN_OPTIMAL_MM_PER_DAY);
-			excessPenalty = Math.exp(-(excess * excess) / (2.0 * scale * scale));
-		}
-		return clamp(moistureAvailability * excessPenalty, 0.0, 1.0);
+		return clamp(moistureAvailability, 0.0, 1.0);
 	}
 
 	private static double dot(Vector2 left, Vector2 right) {
 		return left.x() * right.x() + left.y() * right.y();
+	}
+
+	private static Vector2 lerpUnitVector(Vector2 start, Vector2 end, double delta) {
+		return normalize(new Vector2(
+			lerp(start.x(), end.x(), delta),
+			lerp(start.y(), end.y(), delta)
+		));
 	}
 
 	private static double slopeDegrees(double slopeGrade) {
@@ -572,8 +719,22 @@ public final class EarthClimateService {
 		}
 		Vector2 sourceVector = normalize(new Vector2(-flowVector.x(), -flowVector.y()));
 		double radians = Math.atan2(sourceVector.x(), sourceVector.y());
-		double degrees = Math.toDegrees(radians);
-		return degrees < 0.0 ? degrees + 360.0 : degrees;
+		return normalizeDegrees(Math.toDegrees(radians));
+	}
+
+	private static double normalizeDegrees(double degrees) {
+		double normalized = degrees % 360.0;
+		return normalized < 0.0 ? normalized + 360.0 : normalized;
+	}
+
+	private static Vector2 directionUnitVector(double directionDegrees) {
+		double radians = Math.toRadians(directionDegrees);
+		return new Vector2(Math.sin(radians), Math.cos(radians));
+	}
+
+	private static Vector2 windFlowVector(double windSpeed, double windDirectionDegrees) {
+		Vector2 sourceUnitVector = directionUnitVector(windDirectionDegrees);
+		return new Vector2(-sourceUnitVector.x() * windSpeed, -sourceUnitVector.y() * windSpeed);
 	}
 
 	private static Vector2 normalize(Vector2 vector) {
@@ -608,7 +769,10 @@ public final class EarthClimateService {
 		double longitude,
 		double altitude,
 		double averageTemperature,
-		double averageRainfall
+		double averageRainfall,
+		List<Double> averageMonthlyRainfall,
+		List<Double> averageMonthlyWindSpeed,
+		List<Double> averageMonthlyWindDirection
 	) {
 	}
 

@@ -31,7 +31,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 public final class EarthChunkGenerator extends ChunkGenerator {
-	private static final int CLIMATE_START_YEAR = 2010;
+	private static final int CLIMATE_START_YEAR = 2018;
 	private static final int CLIMATE_END_YEAR = 2020;
 	private static final int WORLD_Y_SHIFT = -40;
 	public static final MapCodec<EarthChunkGenerator> CODEC = RecordCodecBuilder.mapCodec(instance -> instance.group(
