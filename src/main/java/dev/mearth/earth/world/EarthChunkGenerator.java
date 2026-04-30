@@ -40,7 +40,7 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 	private static final double LOCAL_SLOPE_SAMPLE_DISTANCE_METERS = 35.0;
 	private static final double STONE_SLOPE_THRESHOLD = 50.0 / 90.0;
 	private static final double STONE_SLOPE_NOISE_AMPLITUDE = 0.10;
-	private static final double SNOW_SLOPE_THRESHOLD = 50.0 / 90.0;
+	private static final double SNOW_SLOPE_THRESHOLD = 40.0 / 90.0;
 	private static final double SNOW_SLOPE_NOISE_AMPLITUDE = 0.05;
 	private static final double SNOW_TEMP_NOISE_AMPLITUDE_C = 0.65;
 	private static final double SNOW_BASE_START_C = 1.0;
