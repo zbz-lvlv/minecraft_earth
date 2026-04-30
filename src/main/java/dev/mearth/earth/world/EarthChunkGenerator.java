@@ -7,11 +7,14 @@ import dev.mearth.earth.climate.EarthClimateService;
 import dev.mearth.earth.config.EarthConfig;
 import dev.mearth.earth.geo.EarthProjection;
 import dev.mearth.earth.terrain.TerrainTileService;
+import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.VineBlock;
 import net.minecraft.registry.DynamicRegistryManager;
 import net.minecraft.structure.StructureTemplateManager;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
 import net.minecraft.world.HeightLimitView;
 import net.minecraft.world.StructureWorldAccess;
 import net.minecraft.world.Heightmap;
@@ -34,6 +37,14 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 	private static final int CLIMATE_START_YEAR = 2018;
 	private static final int CLIMATE_END_YEAR = 2020;
 	private static final int WORLD_Y_SHIFT = -40;
+	private static final double LOCAL_SLOPE_SAMPLE_DISTANCE_METERS = 35.0;
+	private static final double STONE_SLOPE_THRESHOLD = 50.0 / 90.0;
+	private static final double STONE_SLOPE_NOISE_AMPLITUDE = 0.10;
+	private static final double SNOW_SLOPE_THRESHOLD = 50.0 / 90.0;
+	private static final double SNOW_SLOPE_NOISE_AMPLITUDE = 0.05;
+	private static final double SNOW_TEMP_NOISE_AMPLITUDE_C = 0.65;
+	private static final double SNOW_BASE_START_C = 1.0;
+	private static final double SNOW_ASPECT_AMPLITUDE_C = 2.5;
 	public static final MapCodec<EarthChunkGenerator> CODEC = RecordCodecBuilder.mapCodec(instance -> instance.group(
 		BiomeSource.CODEC.fieldOf("biome_source").forGetter(generator -> generator.biomeSource),
 		Codec.DOUBLE.optionalFieldOf("meters_per_block", 25.0).forGetter(EarthChunkGenerator::metersPerBlock),
@@ -44,19 +55,17 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 
 	private static final BlockState AIR = Blocks.AIR.getDefaultState();
 	private static final BlockState STONE = Blocks.STONE.getDefaultState();
+	private static final BlockState DIRT = Blocks.DIRT.getDefaultState();
+	private static final BlockState GRASS_BLOCK = Blocks.GRASS_BLOCK.getDefaultState();
+	private static final BlockState SHORT_GRASS = Blocks.SHORT_GRASS.getDefaultState();
+	private static final BlockState FERN = Blocks.FERN.getDefaultState();
+	private static final BlockState DANDELION = Blocks.DANDELION.getDefaultState();
+	private static final BlockState POPPY = Blocks.POPPY.getDefaultState();
+	private static final BlockState AZURE_BLUET = Blocks.AZURE_BLUET.getDefaultState();
+	private static final BlockState OXEYE_DAISY = Blocks.OXEYE_DAISY.getDefaultState();
+	private static final BlockState SNOW_BLOCK = Blocks.SNOW_BLOCK.getDefaultState();
 	private static final BlockState WATER = Blocks.WATER.getDefaultState();
-	private static final BlockState[] PLANT_GROWTH_SURFACE_BLOCKS = new BlockState[] {
-		Blocks.RED_CONCRETE.getDefaultState(),
-		Blocks.ORANGE_CONCRETE.getDefaultState(),
-		Blocks.YELLOW_CONCRETE.getDefaultState(),
-		Blocks.LIME_CONCRETE.getDefaultState(),
-		Blocks.GREEN_CONCRETE.getDefaultState(),
-		Blocks.CYAN_CONCRETE.getDefaultState(),
-		Blocks.LIGHT_BLUE_CONCRETE.getDefaultState(),
-		Blocks.BLUE_CONCRETE.getDefaultState(),
-		Blocks.MAGENTA_CONCRETE.getDefaultState(),
-		Blocks.PINK_CONCRETE.getDefaultState()
-	};
+	private static final int VEGETATION_PLACE_FLAGS = Block.NOTIFY_LISTENERS | Block.FORCE_STATE;
 	private final double metersPerBlock;
 	private final int minY;
 	private final int worldHeight;
@@ -101,7 +110,33 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 
 	@Override
 	public void generateFeatures(StructureWorldAccess world, Chunk chunk, StructureAccessor structureAccessor) {
-		// Intentionally empty: the Earth preset uses imported terrain only.
+		BlockPos.Mutable mutable = new BlockPos.Mutable();
+		int chunkStartX = chunk.getPos().getStartX();
+		int chunkStartZ = chunk.getPos().getStartZ();
+		int maxY = this.minY + this.worldHeight - 1;
+
+		for (int localX = 0; localX < 16; localX++) {
+			for (int localZ = 0; localZ < 16; localZ++) {
+				int worldX = chunkStartX + localX;
+				int worldZ = chunkStartZ + localZ;
+				SurfaceColumn surface = getSurfaceColumn(worldX, worldZ, maxY);
+				int surfaceY = surface.surfaceY();
+				if (surfaceY < shiftedSeaLevel()) {
+					continue;
+				}
+
+				if (!surface.supportsVegetation()) {
+					continue;
+				}
+
+				mutable.set(worldX, surfaceY + 1, worldZ);
+				if (!world.getBlockState(mutable).isAir()) {
+					continue;
+				}
+
+				placeVegetation(world, mutable, surfaceY, surface.growth(), worldX, worldZ);
+			}
+		}
 	}
 
 	@Override
@@ -231,8 +266,12 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		double elevationMeters = TerrainTileService.sampleMeters(latitude, longitude);
 		int y = (int)Math.round(elevationMeters / metersPerBlock) - 1 + WORLD_Y_SHIFT;
 		int surfaceY = Math.max(this.minY, Math.min(maxY, y));
-		BlockState surfaceBlock = pickRainfallSurfaceBlock(latitude, longitude, elevationMeters);
-		return new SurfaceColumn(surfaceY, surfaceBlock);
+		EarthClimateService.EffectiveClimate climate = sampleEffectiveClimate(latitude, longitude, elevationMeters);
+		double growth = climate != null ? climate.plantGrowthScore() : 0.0;
+		LocalTerrainAnalysis localTerrain = sampleLocalTerrain(latitude, longitude);
+		BlockState surfaceBlock = pickSurfaceBlock(blockX, blockZ, latitude, climate, localTerrain);
+		boolean supportsVegetation = surfaceBlock == GRASS_BLOCK;
+		return new SurfaceColumn(surfaceY, surfaceBlock, growth, supportsVegetation);
 	}
 
 	private double effectiveMetersPerBlock() {
@@ -264,6 +303,7 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		double altitudeMeters,
 		double groundAltitudeMeters
 	) {
+		LocalTerrainAnalysis localTerrain = sampleLocalTerrain(latitude, longitude);
 		EarthClimateService.EffectiveClimate climate = EarthClimateService.getEffectiveCachedOrFetchAsync(
 			latitude,
 			longitude,
@@ -296,7 +336,9 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 			return;
 		}
 		text.add(
-			"Earth climate terrain: slopeForClimate %.3f (%.1f deg) | uphill aspect %.1f deg | windward %.2f | oro x%.2f".formatted(
+			"Earth climate terrain: localSlope %.3f (%.1f deg) | slopeForClimate %.3f (%.1f deg) | uphill aspect %.1f deg | windward %.2f | oro x%.2f".formatted(
+				localTerrain.normalizedSlope(),
+				localTerrain.slopeDegrees(),
 				climate.slopeForClimate(),
 				climate.slopeDegrees(),
 				climate.aspectDegrees(),
@@ -336,36 +378,391 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 	}
 
 	private BlockState pickGroundBlock(int y, int surfaceY, BlockState surfaceBlock) {
-		if (y >= surfaceY - 2) {
+		if (surfaceBlock == STONE) {
+			return STONE;
+		}
+		if (surfaceBlock == SNOW_BLOCK) {
+			if (y == surfaceY) {
+				return SNOW_BLOCK;
+			}
+			return STONE;
+		}
+		if (y == surfaceY) {
 			return surfaceBlock;
 		}
 		return STONE;
 	}
 
-	private BlockState pickRainfallSurfaceBlock(double latitude, double longitude, double elevationMeters) {
+	private EarthClimateService.EffectiveClimate sampleEffectiveClimate(double latitude, double longitude, double elevationMeters) {
 		try {
-			EarthClimateService.EffectiveClimate climate = EarthClimateService.sampleEffective(
+			return EarthClimateService.sampleEffective(
 				latitude,
 				longitude,
 				elevationMeters,
 				CLIMATE_START_YEAR,
 				CLIMATE_END_YEAR
 			);
-			double normalized = climate.plantGrowthScore();
-			int index = Math.min(
-				PLANT_GROWTH_SURFACE_BLOCKS.length - 1,
-				(int)Math.round(normalized * (PLANT_GROWTH_SURFACE_BLOCKS.length - 1))
-			);
-			return PLANT_GROWTH_SURFACE_BLOCKS[index];
 		} catch (Exception exception) {
-			return Blocks.GRAY_CONCRETE.getDefaultState();
+			return null;
 		}
+	}
+
+	private BlockState pickSurfaceBlock(
+		int blockX,
+		int blockZ,
+		double latitude,
+		EarthClimateService.EffectiveClimate climate,
+		LocalTerrainAnalysis localTerrain
+	) {
+		if (isStonySurface(blockX, blockZ, localTerrain.normalizedSlope())) {
+			return STONE;
+		}
+		if (climate != null && shouldSnowCover(blockX, blockZ, latitude, climate.averageTemperature(), localTerrain)) {
+			return SNOW_BLOCK;
+		}
+		return GRASS_BLOCK;
+	}
+
+	private boolean isStonySurface(int blockX, int blockZ, double normalizedSlope) {
+		double noise = signedNoise(blockX, blockZ, 37, 18.0);
+		double threshold = STONE_SLOPE_THRESHOLD + noise * STONE_SLOPE_NOISE_AMPLITUDE;
+		return normalizedSlope >= threshold;
+	}
+
+	private boolean shouldSnowCover(
+		int blockX,
+		int blockZ,
+		double latitude,
+		double averageTemperature,
+		LocalTerrainAnalysis localTerrain
+	) {
+		double slopeNoise = signedNoise(blockX, blockZ, 71, 22.0);
+		double snowSlopeLimit = SNOW_SLOPE_THRESHOLD + slopeNoise * SNOW_SLOPE_NOISE_AMPLITUDE;
+		if (localTerrain.normalizedSlope() > snowSlopeLimit) {
+			return false;
+		}
+
+		double poleFacingness = poleFacingness(latitude, localTerrain.downhillAspectDegrees());
+		double snowStartTemperature = SNOW_BASE_START_C + SNOW_ASPECT_AMPLITUDE_C * poleFacingness;
+		double tempNoise = signedNoise(blockX, blockZ, 113, 28.0) * SNOW_TEMP_NOISE_AMPLITUDE_C;
+		return averageTemperature <= snowStartTemperature + tempNoise;
+	}
+
+	private LocalTerrainAnalysis sampleLocalTerrain(double latitude, double longitude) {
+		double latitudeRadians = Math.toRadians(latitude);
+		double latitudeDelta = Math.toDegrees(LOCAL_SLOPE_SAMPLE_DISTANCE_METERS / 6_378_137.0);
+		double eastWestMetersPerDegree = Math.cos(latitudeRadians) * 6_378_137.0 * Math.PI / 180.0;
+		double longitudeDelta = eastWestMetersPerDegree > 1.0
+			? LOCAL_SLOPE_SAMPLE_DISTANCE_METERS / eastWestMetersPerDegree
+			: latitudeDelta;
+
+		double north = TerrainTileService.sampleMeters(latitude + latitudeDelta, longitude);
+		double south = TerrainTileService.sampleMeters(latitude - latitudeDelta, longitude);
+		double east = TerrainTileService.sampleMeters(latitude, longitude + longitudeDelta);
+		double west = TerrainTileService.sampleMeters(latitude, longitude - longitudeDelta);
+
+		double dzdx = (east - west) / (2.0 * LOCAL_SLOPE_SAMPLE_DISTANCE_METERS);
+		double dzdy = (north - south) / (2.0 * LOCAL_SLOPE_SAMPLE_DISTANCE_METERS);
+		double slopeGrade = Math.hypot(dzdx, dzdy);
+		double slopeDegrees = slopeDegrees(slopeGrade);
+		double normalizedSlope = normalizedSlopeFromDegrees(slopeDegrees);
+		if (slopeGrade < 1.0e-9) {
+			return new LocalTerrainAnalysis(normalizedSlope, slopeDegrees, Double.NaN);
+		}
+		double downhillAspectDegrees = normalizeDegrees(Math.toDegrees(Math.atan2(-dzdx, -dzdy)));
+		return new LocalTerrainAnalysis(normalizedSlope, slopeDegrees, downhillAspectDegrees);
 	}
 
 	private double clamp(double value, double min, double max) {
 		return Math.max(min, Math.min(max, value));
 	}
 
-	private record SurfaceColumn(int surfaceY, BlockState surfaceBlock) {
+	private double slopeDegrees(double slopeGrade) {
+		return Math.toDegrees(Math.atan(slopeGrade));
+	}
+
+	private double normalizedSlopeFromDegrees(double slopeDegrees) {
+		return clamp(slopeDegrees / 90.0, 0.0, 1.0);
+	}
+
+	private double normalizeDegrees(double degrees) {
+		double normalized = degrees % 360.0;
+		return normalized < 0.0 ? normalized + 360.0 : normalized;
+	}
+
+	private double poleFacingness(double latitude, double downhillAspectDegrees) {
+		if (Double.isNaN(downhillAspectDegrees) || Math.abs(latitude) < 1.0e-6) {
+			return 0.0;
+		}
+		double northFacingness = Math.cos(Math.toRadians(downhillAspectDegrees));
+		double hemisphereSign = Math.signum(latitude);
+		double latitudeWeight = Math.sin(Math.toRadians(Math.abs(latitude)));
+		return clamp(northFacingness * hemisphereSign * latitudeWeight, -1.0, 1.0);
+	}
+
+	private void placeVegetation(
+		StructureWorldAccess world,
+		BlockPos.Mutable plantPos,
+		int surfaceY,
+		double growth,
+		int worldX,
+		int worldZ
+	) {
+		double coverNoise = hashToUnitDouble(worldX, worldZ, 11);
+		double treeNoise = hashToUnitDouble(worldX, worldZ, 29);
+		double flowerNoise = hashToUnitDouble(worldX, worldZ, 47);
+
+		if (growth < 0.18) {
+			return;
+		}
+
+		double treeProbability = treeProbabilityForGrowth(growth);
+
+		if (growth < 0.32) {
+			if (coverNoise < 0.14) {
+				world.setBlockState(plantPos, SHORT_GRASS, VEGETATION_PLACE_FLAGS);
+			} else if (coverNoise < 0.18) {
+				world.setBlockState(plantPos, pickFlower(flowerNoise), VEGETATION_PLACE_FLAGS);
+			}
+			return;
+		}
+
+		if (growth < 0.48) {
+			if (treeNoise < treeProbability && placeTree(
+				world,
+				plantPos.toImmutable(),
+				4,
+				Blocks.ACACIA_LOG.getDefaultState(),
+				Blocks.ACACIA_LEAVES.getDefaultState(),
+				false
+			)) {
+				return;
+			}
+			if (coverNoise < 0.22) {
+				world.setBlockState(plantPos, SHORT_GRASS, VEGETATION_PLACE_FLAGS);
+			} else if (coverNoise < 0.26) {
+				world.setBlockState(plantPos, pickFlower(flowerNoise), VEGETATION_PLACE_FLAGS);
+			} else if (coverNoise < 0.28) {
+				world.setBlockState(plantPos, FERN, VEGETATION_PLACE_FLAGS);
+			}
+			return;
+		}
+
+		if (growth < 0.68) {
+			if (treeNoise < treeProbability && placeTree(
+				world,
+				plantPos.toImmutable(),
+				5,
+				Blocks.OAK_LOG.getDefaultState(),
+				Blocks.OAK_LEAVES.getDefaultState(),
+				false
+			)) {
+				return;
+			}
+			if (coverNoise < 0.30) {
+				world.setBlockState(plantPos, SHORT_GRASS, VEGETATION_PLACE_FLAGS);
+			} else if (coverNoise < 0.36) {
+				world.setBlockState(plantPos, pickFlower(flowerNoise), VEGETATION_PLACE_FLAGS);
+			} else if (coverNoise < 0.42) {
+				world.setBlockState(plantPos, FERN, VEGETATION_PLACE_FLAGS);
+			}
+			return;
+		}
+
+		if (treeNoise < treeProbability && placeTree(
+			world,
+			plantPos.toImmutable(),
+			6,
+			Blocks.JUNGLE_LOG.getDefaultState(),
+			Blocks.JUNGLE_LEAVES.getDefaultState(),
+			true
+		)) {
+			return;
+		}
+		if (coverNoise < 0.36) {
+			world.setBlockState(plantPos, SHORT_GRASS, VEGETATION_PLACE_FLAGS);
+		} else if (coverNoise < 0.44) {
+			world.setBlockState(plantPos, pickFlower(flowerNoise), VEGETATION_PLACE_FLAGS);
+		} else if (coverNoise < 0.66) {
+			world.setBlockState(plantPos, FERN, VEGETATION_PLACE_FLAGS);
+		}
+	}
+
+	private double treeProbabilityForGrowth(double growth) {
+		if (growth < 0.32) {
+			return 0.0;
+		}
+		if (growth < 0.48) {
+			return lerp(0.01, 0.04, (growth - 0.32) / 0.16);
+		}
+		if (growth < 0.70) {
+			return lerp(0.04, 0.20, (growth - 0.48) / 0.22);
+		}
+		return lerp(0.20, 0.32, clamp((growth - 0.70) / 0.30, 0.0, 1.0));
+	}
+
+	private boolean placeTree(
+		StructureWorldAccess world,
+		BlockPos basePos,
+		int trunkHeight,
+		BlockState logState,
+		BlockState leafState,
+		boolean addVines
+	) {
+		int canopyBaseY = basePos.getY() + trunkHeight - 2;
+		int canopyTopY = basePos.getY() + trunkHeight + 1;
+		for (int y = basePos.getY(); y <= canopyTopY; y++) {
+			if (y >= this.minY + this.worldHeight) {
+				return false;
+			}
+			if (y < canopyBaseY) {
+				if (!world.getBlockState(new BlockPos(basePos.getX(), y, basePos.getZ())).isAir()) {
+					return false;
+				}
+				continue;
+			}
+			int radius = y == canopyTopY ? 1 : 2;
+			for (int dx = -radius; dx <= radius; dx++) {
+				for (int dz = -radius; dz <= radius; dz++) {
+					BlockPos leafPos = new BlockPos(basePos.getX() + dx, y, basePos.getZ() + dz);
+					if (!world.getBlockState(leafPos).isAir() && !world.getBlockState(leafPos).isOf(Blocks.VINE)) {
+						return false;
+					}
+				}
+			}
+		}
+
+		for (int offset = 0; offset < trunkHeight; offset++) {
+			world.setBlockState(basePos.up(offset), logState, VEGETATION_PLACE_FLAGS);
+		}
+		for (int y = canopyBaseY; y <= canopyTopY; y++) {
+			int radius = y == canopyTopY ? 1 : 2;
+			if (y == canopyBaseY) {
+				radius = 1;
+			}
+			for (int dx = -radius; dx <= radius; dx++) {
+				for (int dz = -radius; dz <= radius; dz++) {
+					if (Math.abs(dx) == radius && Math.abs(dz) == radius && y != canopyTopY) {
+						continue;
+					}
+					BlockPos leafPos = new BlockPos(basePos.getX() + dx, y, basePos.getZ() + dz);
+					if (world.getBlockState(leafPos).isAir()) {
+						world.setBlockState(leafPos, leafState, VEGETATION_PLACE_FLAGS);
+						if (addVines && y < canopyTopY && Math.abs(dx) + Math.abs(dz) == radius) {
+							placeVineCurtain(world, leafPos, dx, dz);
+						}
+					}
+				}
+			}
+		}
+		return true;
+	}
+
+	private void placeVineCurtain(StructureWorldAccess world, BlockPos anchorPos, int dx, int dz) {
+		Direction face;
+		if (Math.abs(dx) >= Math.abs(dz)) {
+			face = dx > 0 ? Direction.EAST : Direction.WEST;
+		} else {
+			face = dz > 0 ? Direction.SOUTH : Direction.NORTH;
+		}
+		Boolean attached = switch (face) {
+			case NORTH -> true;
+			case SOUTH -> true;
+			case EAST -> true;
+			case WEST -> true;
+			default -> null;
+		};
+		if (attached == null) {
+			return;
+		}
+
+		BlockState vineState = switch (face) {
+			case NORTH -> Blocks.VINE.getDefaultState().with(VineBlock.NORTH, true);
+			case SOUTH -> Blocks.VINE.getDefaultState().with(VineBlock.SOUTH, true);
+			case EAST -> Blocks.VINE.getDefaultState().with(VineBlock.EAST, true);
+			case WEST -> Blocks.VINE.getDefaultState().with(VineBlock.WEST, true);
+			default -> Blocks.VINE.getDefaultState();
+		};
+		for (int drop = 1; drop <= 3; drop++) {
+			BlockPos vinePos = anchorPos.down(drop);
+			if (!world.getBlockState(vinePos).isAir()) {
+				break;
+			}
+			world.setBlockState(vinePos, vineState, VEGETATION_PLACE_FLAGS);
+		}
+	}
+
+	private double hashToUnitDouble(int x, int z, int salt) {
+		long hash = 0x9E3779B97F4A7C15L ^ ((long)x * 0x632BE59BD9B4E019L) ^ ((long)z * 0x85157AF5L) ^ salt;
+		hash ^= hash >>> 33;
+		hash *= 0xff51afd7ed558ccdL;
+		hash ^= hash >>> 33;
+		hash *= 0xc4ceb9fe1a85ec53L;
+		hash ^= hash >>> 33;
+		return (hash & 0x1FFFFFFFFFFFFFL) / (double)0x20000000000000L;
+	}
+
+	private double signedNoise(int worldX, int worldZ, int salt, double scaleBlocks) {
+		return valueNoise2d(worldX / scaleBlocks, worldZ / scaleBlocks, salt) * 2.0 - 1.0;
+	}
+
+	private double valueNoise2d(double x, double z, int salt) {
+		int x0 = fastFloor(x);
+		int z0 = fastFloor(z);
+		int x1 = x0 + 1;
+		int z1 = z0 + 1;
+		double xFraction = x - x0;
+		double zFraction = z - z0;
+		double sx = smoothstep(xFraction);
+		double sz = smoothstep(zFraction);
+
+		double south = lerp(hashToUnitDouble(x0, z0, salt), hashToUnitDouble(x1, z0, salt), sx);
+		double north = lerp(hashToUnitDouble(x0, z1, salt), hashToUnitDouble(x1, z1, salt), sx);
+		return lerp(south, north, sz);
+	}
+
+	private int fastFloor(double value) {
+		int truncated = (int)value;
+		return value < truncated ? truncated - 1 : truncated;
+	}
+
+	private double smoothstep(double value) {
+		double clamped = clamp(value, 0.0, 1.0);
+		return clamped * clamped * (3.0 - 2.0 * clamped);
+	}
+
+	private BlockState pickFlower(double flowerNoise) {
+		if (flowerNoise < 0.25) {
+			return DANDELION;
+		}
+		if (flowerNoise < 0.5) {
+			return POPPY;
+		}
+		if (flowerNoise < 0.75) {
+			return AZURE_BLUET;
+		}
+		return OXEYE_DAISY;
+	}
+
+	private double lerp(double start, double end, double delta) {
+		return start + (end - start) * clamp(delta, 0.0, 1.0);
+	}
+
+	public static int climateStartYear() {
+		return CLIMATE_START_YEAR;
+	}
+
+	public static int climateEndYear() {
+		return CLIMATE_END_YEAR;
+	}
+
+	public static int worldYShift() {
+		return WORLD_Y_SHIFT;
+	}
+
+	private record SurfaceColumn(int surfaceY, BlockState surfaceBlock, double growth, boolean supportsVegetation) {
+	}
+
+	private record LocalTerrainAnalysis(double normalizedSlope, double slopeDegrees, double downhillAspectDegrees) {
 	}
 }

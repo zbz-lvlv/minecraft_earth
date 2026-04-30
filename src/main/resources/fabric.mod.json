@@ -16,6 +16,9 @@
 	"entrypoints": {
 		"main": [
 			"dev.mearth.earth.EarthMod"
+		],
+		"client": [
+			"dev.mearth.earth.client.EarthModClient"
 		]
 	},
 	"mixins": [
