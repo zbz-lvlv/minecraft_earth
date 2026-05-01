@@ -24,6 +24,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -42,7 +43,7 @@ public final class EarthClimateService {
 	private static final double EARTH_RADIUS_METERS = 6_378_137.0;
 	private static final double CLIMATE_SLOPE_SAMPLE_DISTANCE_METERS = 5000.0;
 	private static final double RAINFALL_SLOPE_INFLUENCE = 1.0; // increase to make steeper terrain change rainfall more
-	private static final double RAINFALL_ASPECT_INFLUENCE = 2.0; // increase to make windward/leeward aspect matter more
+	private static final double RAINFALL_ASPECT_INFLUENCE = 0.7; // increase to make windward/leeward aspect matter more
 	private static final double MAX_OROGRAPHIC_MULTIPLIER = 4.0;
 	private static final double MIN_OROGRAPHIC_MULTIPLIER = 0.25;
 	private static final double MOISTURE_FLOW_STRONG_MPS = 4.0;
@@ -54,13 +55,16 @@ public final class EarthClimateService {
 	private static final double PLANT_TEMP_HOT_SIGMA_C = 9.0;
 	private static final double PLANT_RAIN_HALF_SAT_MM_PER_DAY = 1.5;
 	private static final double PLANT_LIMITING_FACTOR_FLOOR = 0.35;
+	private static final double POLAR_GROWTH_MONTH_COUNT = 2.0;
+	private static final double MID_LATITUDE_GROWTH_MONTH_COUNT = 7.0;
+	private static final double EQUATORIAL_GROWTH_MONTH_COUNT = 12.0;
 
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 	private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 	private static final Map<ClimateRequestKey, ClimateSummary> CACHE = new ConcurrentHashMap<>();
 	private static final Map<ClimateRequestKey, CompletableFuture<ClimateSummary>> IN_FLIGHT = new ConcurrentHashMap<>();
 	private static final Path CACHE_DIR = FabricLoader.getInstance().getConfigDir().resolve("earthmod").resolve("climate");
-	private static final String CACHE_VERSION = "v2";
+	private static final String CACHE_VERSION = "v3";
 	private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(2, runnable -> {
 		Thread thread = new Thread(runnable, "earthmod-climate");
 		thread.setDaemon(true);
@@ -254,7 +258,17 @@ public final class EarthClimateService {
 			MAX_OROGRAPHIC_MULTIPLIER
 		);
 		double adjustedRainfall = interpolatedRainfall * orographicMultiplier;
-		double plantGrowthScore = plantGrowthScore(adjustedTemperature, adjustedRainfall);
+		double plantGrowthScore = monthlyPlantGrowthScore(
+			latitude,
+			altitudeDeltaMeters,
+			longitudeFraction,
+			latitudeFraction,
+			orographicMultiplier,
+			southWest,
+			southEast,
+			northWest,
+			northEast
+		);
 
 		return new EffectiveClimate(
 			latitude,
@@ -355,6 +369,7 @@ public final class EarthClimateService {
 		JsonObject windDirectionValues = getObject(parameterObject, WIND_DIRECTION_2M);
 		double averageTemperature = averageAnnualValues(temperatureValues, key.startYear(), key.endYear(), TEMPERATURE_2M);
 		double averageRainfall = averageAnnualValues(rainfallValues, key.startYear(), key.endYear(), PRECIPITATION);
+		List<Double> averageMonthlyTemperature = averageMonthlyValues(temperatureValues, key.startYear(), key.endYear(), TEMPERATURE_2M);
 		List<Double> averageMonthlyRainfall = averageMonthlyValues(rainfallValues, key.startYear(), key.endYear(), PRECIPITATION);
 		List<Double> averageMonthlyWindSpeed = averageMonthlyValues(windSpeedValues, key.startYear(), key.endYear(), WIND_SPEED_2M);
 		List<Double> averageMonthlyWindDirection = averageMonthlyDirectionValues(
@@ -370,6 +385,7 @@ public final class EarthClimateService {
 			altitude,
 			averageTemperature,
 			averageRainfall,
+			averageMonthlyTemperature,
 			averageMonthlyRainfall,
 			averageMonthlyWindSpeed,
 			averageMonthlyWindDirection
@@ -677,6 +693,67 @@ public final class EarthClimateService {
 		);
 	}
 
+	private static double monthlyPlantGrowthScore(
+		double latitude,
+		double altitudeDeltaMeters,
+		double longitudeFraction,
+		double latitudeFraction,
+		double orographicMultiplier,
+		ClimateSummary southWest,
+		ClimateSummary southEast,
+		ClimateSummary northWest,
+		ClimateSummary northEast
+	) {
+		Double[] monthlyGrowthScores = new Double[12];
+		for (int monthIndex = 0; monthIndex < 12; monthIndex++) {
+			double interpolatedMonthlyTemperature = bilerp(
+				southWest.averageMonthlyTemperature().get(monthIndex),
+				southEast.averageMonthlyTemperature().get(monthIndex),
+				northWest.averageMonthlyTemperature().get(monthIndex),
+				northEast.averageMonthlyTemperature().get(monthIndex),
+				longitudeFraction,
+				latitudeFraction
+			);
+			double interpolatedMonthlyRainfall = bilerp(
+				southWest.averageMonthlyRainfall().get(monthIndex),
+				southEast.averageMonthlyRainfall().get(monthIndex),
+				northWest.averageMonthlyRainfall().get(monthIndex),
+				northEast.averageMonthlyRainfall().get(monthIndex),
+				longitudeFraction,
+				latitudeFraction
+			);
+			double adjustedMonthlyTemperature = interpolatedMonthlyTemperature
+				- altitudeDeltaMeters * ENVIRONMENTAL_LAPSE_RATE_C_PER_KM / 1000.0;
+			double adjustedMonthlyRainfall = interpolatedMonthlyRainfall * orographicMultiplier;
+			monthlyGrowthScores[monthIndex] = plantGrowthScore(adjustedMonthlyTemperature, adjustedMonthlyRainfall);
+		}
+
+		int monthsUsed = latitudeWeightedGrowthMonthCount(latitude);
+		List<Double> strongestGrowthMonths = List.of(monthlyGrowthScores).stream()
+			.sorted(Comparator.reverseOrder())
+			.limit(monthsUsed)
+			.toList();
+		double totalGrowth = 0.0;
+		for (double monthlyGrowth : strongestGrowthMonths) {
+			totalGrowth += monthlyGrowth;
+		}
+
+		return totalGrowth / strongestGrowthMonths.size();
+	}
+
+	private static int latitudeWeightedGrowthMonthCount(double latitude) {
+		double absoluteLatitude = Math.abs(latitude);
+		double monthCount;
+		if (absoluteLatitude <= 45.0) {
+			double fractionToMidLatitude = absoluteLatitude / 45.0;
+			monthCount = lerp(EQUATORIAL_GROWTH_MONTH_COUNT, MID_LATITUDE_GROWTH_MONTH_COUNT, fractionToMidLatitude);
+		} else {
+			double fractionToPole = (absoluteLatitude - 45.0) / 45.0;
+			monthCount = lerp(MID_LATITUDE_GROWTH_MONTH_COUNT, POLAR_GROWTH_MONTH_COUNT, fractionToPole);
+		}
+		return Math.max(1, Math.min(12, (int)Math.ceil(monthCount)));
+	}
+
 	private static double temperaturePlantSuitability(double temperatureC) {
 		double delta = temperatureC - PLANT_TEMP_OPTIMAL_C;
 		double sigma = delta < 0.0 ? PLANT_TEMP_COOL_SIGMA_C : PLANT_TEMP_HOT_SIGMA_C;
@@ -770,6 +847,7 @@ public final class EarthClimateService {
 		double altitude,
 		double averageTemperature,
 		double averageRainfall,
+		List<Double> averageMonthlyTemperature,
 		List<Double> averageMonthlyRainfall,
 		List<Double> averageMonthlyWindSpeed,
 		List<Double> averageMonthlyWindDirection

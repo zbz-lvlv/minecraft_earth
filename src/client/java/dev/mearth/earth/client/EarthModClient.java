@@ -18,8 +18,9 @@ import net.minecraft.world.BlockRenderView;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class EarthModClient implements ClientModInitializer {
-	private static final double DRY_RAINFALL_THRESHOLD_MM_PER_DAY = 0.35;
-	private static final double WET_RAINFALL_THRESHOLD_MM_PER_DAY = 3.5;
+	private static final double DRY_GROWTH_THRESHOLD = 0.18;
+	private static final double MIN_COLOR_GROWTH_THRESHOLD = 0.48;
+	private static final double LUSH_GROWTH_THRESHOLD = 0.68;
 	private static final int DRY_GRASS_COLOR = 0xf5c958;
 	private static final int LUSH_GRASS_COLOR = 0x3f822f;
 	private static final int DEFAULT_GRASS_COLOR = 0x91BD59;
@@ -40,7 +41,8 @@ public final class EarthModClient implements ClientModInitializer {
 			this::colorLeavesByClimate,
 			Blocks.OAK_LEAVES,
 			Blocks.ACACIA_LEAVES,
-			Blocks.JUNGLE_LEAVES
+			Blocks.JUNGLE_LEAVES,
+			Blocks.VINE
 		);
 	}
 
@@ -54,7 +56,7 @@ public final class EarthModClient implements ClientModInitializer {
 			return DEFAULT_GRASS_COLOR;
 		}
 
-		return GRASS_COLOR_CACHE.computeIfAbsent(colorCacheKey(pos), ignored -> loadGroundClimateColor(pos.getX(), pos.getZ()));
+		return GRASS_COLOR_CACHE.computeIfAbsent(colorCacheKey(pos), ignored -> loadGroundClimateColor(pos.getX(), pos.getZ(), false));
 	}
 
 	private int colorLeavesByClimate(BlockState state, BlockRenderView view, BlockPos pos, int tintIndex) {
@@ -67,10 +69,10 @@ public final class EarthModClient implements ClientModInitializer {
 			return DEFAULT_GRASS_COLOR;
 		}
 
-		return LEAF_COLOR_CACHE.computeIfAbsent(colorCacheKey(pos), ignored -> loadGroundClimateColor(pos.getX(), pos.getZ()));
+		return LEAF_COLOR_CACHE.computeIfAbsent(colorCacheKey(pos), ignored -> loadGroundClimateColor(pos.getX(), pos.getZ(), true));
 	}
 
-	private int loadGroundClimateColor(int blockX, int blockZ) {
+	private int loadGroundClimateColor(int blockX, int blockZ, boolean leafTint) {
 		try {
 			double eastWestMetersPerBlock = EarthConfig.metersPerBlock() * 30.0 / 25.0;
 			double northSouthMetersPerBlock = EarthConfig.metersPerBlock();
@@ -84,23 +86,37 @@ public final class EarthModClient implements ClientModInitializer {
 				EarthChunkGenerator.climateStartYear(),
 				EarthChunkGenerator.climateEndYear()
 			);
-			return colorForRainfall(climate.averageRainfall());
+			return leafTint ? colorForLeafGrowth(climate.plantGrowthScore()) : colorForGrassGrowth(climate.plantGrowthScore());
 		} catch (Exception ignored) {
 			return DEFAULT_GRASS_COLOR;
 		}
 	}
 
-	private int colorForRainfall(double rainfallMmPerDay) {
-		double clampedRainfall = Math.max(0.0, rainfallMmPerDay);
-		if (clampedRainfall <= DRY_RAINFALL_THRESHOLD_MM_PER_DAY) {
+	private int colorForGrassGrowth(double growth) {
+		double clampedGrowth = clamp(growth, DRY_GROWTH_THRESHOLD, LUSH_GROWTH_THRESHOLD);
+		if (clampedGrowth <= DRY_GROWTH_THRESHOLD) {
 			return DRY_GRASS_COLOR;
 		}
-		if (clampedRainfall >= WET_RAINFALL_THRESHOLD_MM_PER_DAY) {
+		if (clampedGrowth >= LUSH_GROWTH_THRESHOLD) {
 			return LUSH_GRASS_COLOR;
 		}
-		double gradientDelta = (clampedRainfall - DRY_RAINFALL_THRESHOLD_MM_PER_DAY)
-			/ (WET_RAINFALL_THRESHOLD_MM_PER_DAY - DRY_RAINFALL_THRESHOLD_MM_PER_DAY);
+		double gradientDelta = (clampedGrowth - DRY_GROWTH_THRESHOLD)
+			/ (LUSH_GROWTH_THRESHOLD - DRY_GROWTH_THRESHOLD);
 		return lerpColor(DRY_GRASS_COLOR, LUSH_GRASS_COLOR, gradientDelta);
+	}
+
+	private int colorForLeafGrowth(double growth) {
+		double clampedGrowth = clamp(growth, MIN_COLOR_GROWTH_THRESHOLD, LUSH_GROWTH_THRESHOLD);
+		if (clampedGrowth >= LUSH_GROWTH_THRESHOLD) {
+			return LUSH_GRASS_COLOR;
+		}
+		double gradientDelta = (clampedGrowth - DRY_GROWTH_THRESHOLD)
+			/ (LUSH_GROWTH_THRESHOLD - DRY_GROWTH_THRESHOLD);
+		return lerpColor(DRY_GRASS_COLOR, LUSH_GRASS_COLOR, gradientDelta);
+	}
+
+	private double clamp(double value, double min, double max) {
+		return Math.max(min, Math.min(max, value));
 	}
 
 	private int lerpColor(int startColor, int endColor, double delta) {

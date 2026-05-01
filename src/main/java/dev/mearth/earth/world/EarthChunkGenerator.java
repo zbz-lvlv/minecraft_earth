@@ -38,13 +38,18 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 	private static final int CLIMATE_END_YEAR = 2020;
 	private static final int WORLD_Y_SHIFT = -40;
 	private static final double LOCAL_SLOPE_SAMPLE_DISTANCE_METERS = 35.0;
-	private static final double STONE_SLOPE_THRESHOLD = 50.0 / 90.0;
-	private static final double STONE_SLOPE_NOISE_AMPLITUDE = 0.10;
+	private static final double STONE_SLOPE_START_DEGREES = 15.0;
+	private static final double STONE_SLOPE_MIDPOINT_DEGREES = 50.0;
+	private static final double STONE_SLOPE_FULL_DEGREES = 60.0;
+	private static final double STONE_PROBABILITY_NOISE_AMPLITUDE = 0.08;
+	private static final double STONE_PATCH_SCALE_BLOCKS = 42.0;
 	private static final double SNOW_SLOPE_THRESHOLD = 40.0 / 90.0;
 	private static final double SNOW_SLOPE_NOISE_AMPLITUDE = 0.05;
 	private static final double SNOW_TEMP_NOISE_AMPLITUDE_C = 0.65;
 	private static final double SNOW_BASE_START_C = 1.0;
 	private static final double SNOW_ASPECT_AMPLITUDE_C = 2.5;
+	private static final double UNDERGROWTH_START_GROWTH = 0.60;
+	private static final double UNDERGROWTH_FULL_GROWTH = 0.80;
 	public static final MapCodec<EarthChunkGenerator> CODEC = RecordCodecBuilder.mapCodec(instance -> instance.group(
 		BiomeSource.CODEC.fieldOf("biome_source").forGetter(generator -> generator.biomeSource),
 		Codec.DOUBLE.optionalFieldOf("meters_per_block", 25.0).forGetter(EarthChunkGenerator::metersPerBlock),
@@ -134,7 +139,7 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 					continue;
 				}
 
-				placeVegetation(world, mutable, surfaceY, surface.growth(), worldX, worldZ);
+				placeVegetation(world, mutable, surfaceY, surface.surfaceBlock(), surface.growth(), worldX, worldZ);
 			}
 		}
 	}
@@ -270,7 +275,7 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		double growth = climate != null ? climate.plantGrowthScore() : 0.0;
 		LocalTerrainAnalysis localTerrain = sampleLocalTerrain(latitude, longitude);
 		BlockState surfaceBlock = pickSurfaceBlock(blockX, blockZ, latitude, climate, localTerrain);
-		boolean supportsVegetation = surfaceBlock == GRASS_BLOCK;
+		boolean supportsVegetation = surfaceBlock == GRASS_BLOCK || surfaceBlock == SNOW_BLOCK;
 		return new SurfaceColumn(surfaceY, surfaceBlock, growth, supportsVegetation);
 	}
 
@@ -414,7 +419,7 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		EarthClimateService.EffectiveClimate climate,
 		LocalTerrainAnalysis localTerrain
 	) {
-		if (isStonySurface(blockX, blockZ, localTerrain.normalizedSlope())) {
+		if (isStonySurface(blockX, blockZ, localTerrain.slopeDegrees())) {
 			return STONE;
 		}
 		if (climate != null && shouldSnowCover(blockX, blockZ, latitude, climate.averageTemperature(), localTerrain)) {
@@ -423,10 +428,20 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		return GRASS_BLOCK;
 	}
 
-	private boolean isStonySurface(int blockX, int blockZ, double normalizedSlope) {
-		double noise = signedNoise(blockX, blockZ, 37, 18.0);
-		double threshold = STONE_SLOPE_THRESHOLD + noise * STONE_SLOPE_NOISE_AMPLITUDE;
-		return normalizedSlope >= threshold;
+	private boolean isStonySurface(int blockX, int blockZ, double slopeDegrees) {
+		double normalizedSlope = clamp(
+			(slopeDegrees - STONE_SLOPE_START_DEGREES) / (STONE_SLOPE_FULL_DEGREES - STONE_SLOPE_START_DEGREES),
+			0.0,
+			1.0
+		);
+		double midpointFraction = (STONE_SLOPE_MIDPOINT_DEGREES - STONE_SLOPE_START_DEGREES)
+			/ (STONE_SLOPE_FULL_DEGREES - STONE_SLOPE_START_DEGREES);
+		double curveExponent = Math.log(0.5) / Math.log(midpointFraction);
+		double baseRockProbability = Math.pow(normalizedSlope, curveExponent);
+		double noise = signedNoise(blockX, blockZ, 37, 18.0) * STONE_PROBABILITY_NOISE_AMPLITUDE;
+		double rockProbability = clamp(baseRockProbability + noise, 0.0, 1.0);
+		double rockPatchNoise = valueNoise2d(blockX / STONE_PATCH_SCALE_BLOCKS, blockZ / STONE_PATCH_SCALE_BLOCKS, 53);
+		return rockPatchNoise < rockProbability;
 	}
 
 	private boolean shouldSnowCover(
@@ -504,13 +519,16 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		StructureWorldAccess world,
 		BlockPos.Mutable plantPos,
 		int surfaceY,
+		BlockState surfaceBlock,
 		double growth,
 		int worldX,
 		int worldZ
 	) {
+		boolean snowySurface = surfaceBlock == SNOW_BLOCK;
 		double coverNoise = hashToUnitDouble(worldX, worldZ, 11);
 		double treeNoise = hashToUnitDouble(worldX, worldZ, 29);
 		double flowerNoise = hashToUnitDouble(worldX, worldZ, 47);
+		double undergrowthNoise = hashToUnitDouble(worldX, worldZ, 59);
 
 		if (growth < 0.18) {
 			return;
@@ -519,9 +537,9 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		double treeProbability = treeProbabilityForGrowth(growth);
 
 		if (growth < 0.32) {
-			if (coverNoise < 0.14) {
+			if (!snowySurface && coverNoise < 0.14) {
 				world.setBlockState(plantPos, SHORT_GRASS, VEGETATION_PLACE_FLAGS);
-			} else if (coverNoise < 0.18) {
+			} else if (!snowySurface && coverNoise < 0.18) {
 				world.setBlockState(plantPos, pickFlower(flowerNoise), VEGETATION_PLACE_FLAGS);
 			}
 			return;
@@ -538,11 +556,11 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 			)) {
 				return;
 			}
-			if (coverNoise < 0.22) {
+			if (!snowySurface && coverNoise < 0.22) {
 				world.setBlockState(plantPos, SHORT_GRASS, VEGETATION_PLACE_FLAGS);
-			} else if (coverNoise < 0.26) {
+			} else if (!snowySurface && coverNoise < 0.26) {
 				world.setBlockState(plantPos, pickFlower(flowerNoise), VEGETATION_PLACE_FLAGS);
-			} else if (coverNoise < 0.28) {
+			} else if (!snowySurface && coverNoise < 0.28) {
 				world.setBlockState(plantPos, FERN, VEGETATION_PLACE_FLAGS);
 			}
 			return;
@@ -559,11 +577,21 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 			)) {
 				return;
 			}
-			if (coverNoise < 0.30) {
+			if (!snowySurface && growth >= UNDERGROWTH_START_GROWTH && placeUndergrowth(
+				world,
+				plantPos,
+				growth,
+				coverNoise,
+				flowerNoise,
+				undergrowthNoise
+			)) {
+				return;
+			}
+			if (!snowySurface && coverNoise < 0.30) {
 				world.setBlockState(plantPos, SHORT_GRASS, VEGETATION_PLACE_FLAGS);
-			} else if (coverNoise < 0.36) {
+			} else if (!snowySurface && coverNoise < 0.36) {
 				world.setBlockState(plantPos, pickFlower(flowerNoise), VEGETATION_PLACE_FLAGS);
-			} else if (coverNoise < 0.42) {
+			} else if (!snowySurface && coverNoise < 0.42) {
 				world.setBlockState(plantPos, FERN, VEGETATION_PLACE_FLAGS);
 			}
 			return;
@@ -579,11 +607,21 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		)) {
 			return;
 		}
-		if (coverNoise < 0.36) {
+		if (!snowySurface && placeUndergrowth(
+			world,
+			plantPos,
+			growth,
+			coverNoise,
+			flowerNoise,
+			undergrowthNoise
+		)) {
+			return;
+		}
+		if (!snowySurface && coverNoise < 0.36) {
 			world.setBlockState(plantPos, SHORT_GRASS, VEGETATION_PLACE_FLAGS);
-		} else if (coverNoise < 0.44) {
+		} else if (!snowySurface && coverNoise < 0.44) {
 			world.setBlockState(plantPos, pickFlower(flowerNoise), VEGETATION_PLACE_FLAGS);
-		} else if (coverNoise < 0.66) {
+		} else if (!snowySurface && coverNoise < 0.66) {
 			world.setBlockState(plantPos, FERN, VEGETATION_PLACE_FLAGS);
 		}
 	}
@@ -599,6 +637,51 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 			return lerp(0.04, 0.20, (growth - 0.48) / 0.22);
 		}
 		return lerp(0.20, 0.32, clamp((growth - 0.70) / 0.30, 0.0, 1.0));
+	}
+
+	private boolean placeUndergrowth(
+		StructureWorldAccess world,
+		BlockPos.Mutable plantPos,
+		double growth,
+		double coverNoise,
+		double flowerNoise,
+		double undergrowthNoise
+	) {
+		double density = undergrowthDensityForGrowth(growth);
+		if (density <= 0.0) {
+			return false;
+		}
+
+		double undergrowthChance = lerp(0.22, 0.72, density);
+		if (coverNoise >= undergrowthChance) {
+			return false;
+		}
+
+		if (undergrowthNoise < lerp(0.25, 0.12, density)) {
+			world.setBlockState(plantPos, pickFlower(flowerNoise), VEGETATION_PLACE_FLAGS);
+			return true;
+		}
+		if (undergrowthNoise < lerp(0.70, 0.30, density)) {
+			world.setBlockState(plantPos, SHORT_GRASS, VEGETATION_PLACE_FLAGS);
+			return true;
+		}
+
+		world.setBlockState(plantPos, FERN, VEGETATION_PLACE_FLAGS);
+		return true;
+	}
+
+	private double undergrowthDensityForGrowth(double growth) {
+		if (growth <= UNDERGROWTH_START_GROWTH) {
+			return 0.0;
+		}
+		if (growth >= UNDERGROWTH_FULL_GROWTH) {
+			return 1.0;
+		}
+		return clamp(
+			(growth - UNDERGROWTH_START_GROWTH) / (UNDERGROWTH_FULL_GROWTH - UNDERGROWTH_START_GROWTH),
+			0.0,
+			1.0
+		);
 	}
 
 	private boolean placeTree(
@@ -677,10 +760,10 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		}
 
 		BlockState vineState = switch (face) {
-			case NORTH -> Blocks.VINE.getDefaultState().with(VineBlock.NORTH, true);
-			case SOUTH -> Blocks.VINE.getDefaultState().with(VineBlock.SOUTH, true);
-			case EAST -> Blocks.VINE.getDefaultState().with(VineBlock.EAST, true);
-			case WEST -> Blocks.VINE.getDefaultState().with(VineBlock.WEST, true);
+			case NORTH -> Blocks.VINE.getDefaultState().with(VineBlock.NORTH, true).with(VineBlock.UP, true);
+			case SOUTH -> Blocks.VINE.getDefaultState().with(VineBlock.SOUTH, true).with(VineBlock.UP, true);
+			case EAST -> Blocks.VINE.getDefaultState().with(VineBlock.EAST, true).with(VineBlock.UP, true);
+			case WEST -> Blocks.VINE.getDefaultState().with(VineBlock.WEST, true).with(VineBlock.UP, true);
 			default -> Blocks.VINE.getDefaultState();
 		};
 		for (int drop = 1; drop <= 3; drop++) {
