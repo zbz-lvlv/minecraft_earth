@@ -10,6 +10,7 @@ import dev.mearth.earth.terrain.TerrainTileService;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.LeavesBlock;
 import net.minecraft.block.VineBlock;
 import net.minecraft.registry.DynamicRegistryManager;
 import net.minecraft.structure.StructureTemplateManager;
@@ -69,6 +70,9 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 	private static final BlockState AZURE_BLUET = Blocks.AZURE_BLUET.getDefaultState();
 	private static final BlockState OXEYE_DAISY = Blocks.OXEYE_DAISY.getDefaultState();
 	private static final BlockState SNOW_BLOCK = Blocks.SNOW_BLOCK.getDefaultState();
+	private static final BlockState ACACIA_LEAVES = Blocks.ACACIA_LEAVES.getDefaultState().with(LeavesBlock.PERSISTENT, true);
+	private static final BlockState OAK_LEAVES = Blocks.OAK_LEAVES.getDefaultState().with(LeavesBlock.PERSISTENT, true);
+	private static final BlockState JUNGLE_LEAVES = Blocks.JUNGLE_LEAVES.getDefaultState().with(LeavesBlock.PERSISTENT, true);
 	private static final BlockState WATER = Blocks.WATER.getDefaultState();
 	private static final int VEGETATION_PLACE_FLAGS = Block.NOTIFY_LISTENERS | Block.FORCE_STATE;
 	private final double metersPerBlock;
@@ -548,12 +552,12 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		if (growth < 0.48) {
 			if (treeNoise < treeProbability && placeTree(
 				world,
-				plantPos.toImmutable(),
-				4,
-				Blocks.ACACIA_LOG.getDefaultState(),
-				Blocks.ACACIA_LEAVES.getDefaultState(),
-				false
-			)) {
+					plantPos.toImmutable(),
+					4,
+					Blocks.ACACIA_LOG.getDefaultState(),
+					ACACIA_LEAVES,
+					false
+				)) {
 				return;
 			}
 			if (!snowySurface && coverNoise < 0.22) {
@@ -569,12 +573,12 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		if (growth < 0.68) {
 			if (treeNoise < treeProbability && placeTree(
 				world,
-				plantPos.toImmutable(),
-				5,
-				Blocks.OAK_LOG.getDefaultState(),
-				Blocks.OAK_LEAVES.getDefaultState(),
-				false
-			)) {
+					plantPos.toImmutable(),
+					5,
+					Blocks.OAK_LOG.getDefaultState(),
+					OAK_LEAVES,
+					false
+				)) {
 				return;
 			}
 			if (!snowySurface && growth >= UNDERGROWTH_START_GROWTH && placeUndergrowth(
@@ -599,12 +603,12 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 
 		if (treeNoise < treeProbability && placeTree(
 			world,
-			plantPos.toImmutable(),
-			6,
-			Blocks.JUNGLE_LOG.getDefaultState(),
-			Blocks.JUNGLE_LEAVES.getDefaultState(),
-			true
-		)) {
+				plantPos.toImmutable(),
+				6,
+				Blocks.JUNGLE_LOG.getDefaultState(),
+				JUNGLE_LEAVES,
+				true
+			)) {
 			return;
 		}
 		if (!snowySurface && placeUndergrowth(
@@ -742,30 +746,7 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 	}
 
 	private void placeVineCurtain(StructureWorldAccess world, BlockPos anchorPos, int dx, int dz) {
-		Direction face;
-		if (Math.abs(dx) >= Math.abs(dz)) {
-			face = dx > 0 ? Direction.EAST : Direction.WEST;
-		} else {
-			face = dz > 0 ? Direction.SOUTH : Direction.NORTH;
-		}
-		Boolean attached = switch (face) {
-			case NORTH -> true;
-			case SOUTH -> true;
-			case EAST -> true;
-			case WEST -> true;
-			default -> null;
-		};
-		if (attached == null) {
-			return;
-		}
-
-		BlockState vineState = switch (face) {
-			case NORTH -> Blocks.VINE.getDefaultState().with(VineBlock.NORTH, true).with(VineBlock.UP, true);
-			case SOUTH -> Blocks.VINE.getDefaultState().with(VineBlock.SOUTH, true).with(VineBlock.UP, true);
-			case EAST -> Blocks.VINE.getDefaultState().with(VineBlock.EAST, true).with(VineBlock.UP, true);
-			case WEST -> Blocks.VINE.getDefaultState().with(VineBlock.WEST, true).with(VineBlock.UP, true);
-			default -> Blocks.VINE.getDefaultState();
-		};
+		BlockState vineState = Blocks.VINE.getDefaultState().with(VineBlock.UP, true);
 		for (int drop = 1; drop <= 3; drop++) {
 			BlockPos vinePos = anchorPos.down(drop);
 			if (!world.getBlockState(vinePos).isAir()) {
