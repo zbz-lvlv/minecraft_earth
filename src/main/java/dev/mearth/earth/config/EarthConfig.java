@@ -69,6 +69,10 @@ public final class EarthConfig {
 		return data.nasaPowerMonthlyEndpoint;
 	}
 
+	public static String hydroOverpassEndpoint() {
+		return data.hydroOverpassEndpoint;
+	}
+
 	public static final class Data {
 		public double metersPerBlock = 25.0;
 		public int seaLevel = 0;
@@ -77,5 +81,6 @@ public final class EarthConfig {
 		public int terrainZoom = 13;
 		public String nominatimEndpoint = "https://nominatim.openstreetmap.org/search";
 		public String nasaPowerMonthlyEndpoint = "https://power.larc.nasa.gov/api/temporal/monthly/point";
+		public String hydroOverpassEndpoint = "https://overpass-api.de/api/interpreter";
 	}
 }

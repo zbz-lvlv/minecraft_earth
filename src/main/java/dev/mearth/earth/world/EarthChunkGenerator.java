@@ -6,6 +6,7 @@ import com.mojang.serialization.codecs.RecordCodecBuilder;
 import dev.mearth.earth.climate.EarthClimateService;
 import dev.mearth.earth.config.EarthConfig;
 import dev.mearth.earth.geo.EarthProjection;
+import dev.mearth.earth.hydro.EarthHydroService;
 import dev.mearth.earth.terrain.TerrainTileService;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
@@ -31,7 +32,10 @@ import net.minecraft.world.gen.chunk.placement.StructurePlacementCalculator;
 import net.minecraft.world.gen.noise.NoiseConfig;
 import net.minecraft.world.ChunkRegion;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 public final class EarthChunkGenerator extends ChunkGenerator {
@@ -51,6 +55,7 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 	private static final double SNOW_ASPECT_AMPLITUDE_C = 2.5;
 	private static final double UNDERGROWTH_START_GROWTH = 0.60;
 	private static final double UNDERGROWTH_FULL_GROWTH = 0.80;
+	private static final int SURFACE_COLUMN_CACHE_LIMIT = 32_768;
 	public static final MapCodec<EarthChunkGenerator> CODEC = RecordCodecBuilder.mapCodec(instance -> instance.group(
 		BiomeSource.CODEC.fieldOf("biome_source").forGetter(generator -> generator.biomeSource),
 		Codec.DOUBLE.optionalFieldOf("meters_per_block", 25.0).forGetter(EarthChunkGenerator::metersPerBlock),
@@ -61,7 +66,7 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 
 	private static final BlockState AIR = Blocks.AIR.getDefaultState();
 	private static final BlockState STONE = Blocks.STONE.getDefaultState();
-	private static final BlockState DIRT = Blocks.DIRT.getDefaultState();
+	private static final BlockState SAND = Blocks.SAND.getDefaultState();
 	private static final BlockState GRASS_BLOCK = Blocks.GRASS_BLOCK.getDefaultState();
 	private static final BlockState SHORT_GRASS = Blocks.SHORT_GRASS.getDefaultState();
 	private static final BlockState FERN = Blocks.FERN.getDefaultState();
@@ -74,11 +79,20 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 	private static final BlockState OAK_LEAVES = Blocks.OAK_LEAVES.getDefaultState().with(LeavesBlock.PERSISTENT, true);
 	private static final BlockState JUNGLE_LEAVES = Blocks.JUNGLE_LEAVES.getDefaultState().with(LeavesBlock.PERSISTENT, true);
 	private static final BlockState WATER = Blocks.WATER.getDefaultState();
+	private static final BlockState ICE = Blocks.ICE.getDefaultState();
 	private static final int VEGETATION_PLACE_FLAGS = Block.NOTIFY_LISTENERS | Block.FORCE_STATE;
 	private final double metersPerBlock;
 	private final int minY;
 	private final int worldHeight;
 	private final int seaLevel;
+	private final Map<SurfaceColumnCacheKey, SurfaceColumn> surfaceColumnCache = Collections.synchronizedMap(
+		new LinkedHashMap<>(SURFACE_COLUMN_CACHE_LIMIT, 0.75f, true) {
+			@Override
+			protected boolean removeEldestEntry(Map.Entry<SurfaceColumnCacheKey, SurfaceColumn> eldest) {
+				return size() > SURFACE_COLUMN_CACHE_LIMIT;
+			}
+		}
+	);
 
 	public EarthChunkGenerator(BiomeSource biomeSource, double metersPerBlock, int minY, int worldHeight, int seaLevel) {
 		super(biomeSource);
@@ -123,12 +137,13 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		int chunkStartX = chunk.getPos().getStartX();
 		int chunkStartZ = chunk.getPos().getStartZ();
 		int maxY = this.minY + this.worldHeight - 1;
+		SurfaceColumn[] columns = buildChunkSurfaceColumns(chunkStartX, chunkStartZ, maxY);
 
 		for (int localX = 0; localX < 16; localX++) {
 			for (int localZ = 0; localZ < 16; localZ++) {
 				int worldX = chunkStartX + localX;
 				int worldZ = chunkStartZ + localZ;
-				SurfaceColumn surface = getSurfaceColumn(worldX, worldZ, maxY);
+				SurfaceColumn surface = columns[columnIndex(localX, localZ)];
 				int surfaceY = surface.surfaceY();
 				if (surfaceY < shiftedSeaLevel()) {
 					continue;
@@ -170,12 +185,13 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		int chunkStartX = chunk.getPos().getStartX();
 		int chunkStartZ = chunk.getPos().getStartZ();
 		int maxY = this.minY + this.worldHeight - 1;
+		SurfaceColumn[] columns = buildChunkSurfaceColumns(chunkStartX, chunkStartZ, maxY);
 
 		for (int localX = 0; localX < 16; localX++) {
 			for (int localZ = 0; localZ < 16; localZ++) {
 				int worldX = chunkStartX + localX;
 				int worldZ = chunkStartZ + localZ;
-				SurfaceColumn surface = getSurfaceColumn(worldX, worldZ, maxY);
+				SurfaceColumn surface = columns[columnIndex(localX, localZ)];
 				int surfaceY = surface.surfaceY();
 
 				for (int y = this.minY; y <= surfaceY; y++) {
@@ -183,7 +199,13 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 					chunk.setBlockState(mutable, pickGroundBlock(y, surfaceY, surface.surfaceBlock()), false);
 				}
 
-				if (surfaceY < shiftedSeaLevel()) {
+				Integer lakeWaterSurfaceY = surface.waterSurfaceY();
+				if (lakeWaterSurfaceY != null) {
+					for (int y = surfaceY + 1; y <= lakeWaterSurfaceY && y <= maxY; y++) {
+						mutable.set(worldX, y, worldZ);
+						chunk.setBlockState(mutable, surface.lakeSurfaceBlock(), false);
+					}
+				} else if (surfaceY < shiftedSeaLevel()) {
 					for (int y = surfaceY + 1; y <= shiftedSeaLevel() && y <= maxY; y++) {
 						mutable.set(worldX, y, worldZ);
 						chunk.setBlockState(mutable, WATER, false);
@@ -197,7 +219,9 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 
 	@Override
 	public int getHeight(int x, int z, Heightmap.Type heightmap, HeightLimitView world, NoiseConfig noiseConfig) {
-		return getSurfaceColumn(x, z, this.minY + this.worldHeight - 1).surfaceY() + 1;
+		SurfaceColumn surface = getSurfaceColumn(x, z, this.minY + this.worldHeight - 1);
+		int topY = surface.waterSurfaceY() != null ? surface.waterSurfaceY() : surface.surfaceY();
+		return topY + 1;
 	}
 
 	@Override
@@ -210,6 +234,8 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 			int y = this.minY + index;
 			if (y <= surfaceY) {
 				states[index] = pickGroundBlock(y, surfaceY, surface.surfaceBlock());
+			} else if (surface.waterSurfaceY() != null && y <= surface.waterSurfaceY()) {
+				states[index] = surface.lakeSurfaceBlock();
 			} else if (y <= shiftedSeaLevel()) {
 				states[index] = WATER;
 			} else {
@@ -269,18 +295,45 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 	}
 
 	private SurfaceColumn getSurfaceColumn(int blockX, int blockZ, int maxY) {
+		SurfaceColumnCacheKey cacheKey = new SurfaceColumnCacheKey(blockX, blockZ, maxY);
+		SurfaceColumn cached = this.surfaceColumnCache.get(cacheKey);
+		if (cached != null) {
+			return cached;
+		}
+
 		double latitude = EarthProjection.blockZToLatitude(blockZ, northSouthMetersPerBlock());
 		double longitude = EarthProjection.blockXToLongitude(blockX, eastWestMetersPerBlock());
 		double metersPerBlock = effectiveMetersPerBlock();
 		double elevationMeters = TerrainTileService.sampleMeters(latitude, longitude);
-		int y = (int)Math.round(elevationMeters / metersPerBlock) - 1 + WORLD_Y_SHIFT;
-		int surfaceY = Math.max(this.minY, Math.min(maxY, y));
+		int terrainY = Math.max(this.minY, Math.min(maxY, (int)Math.round(elevationMeters / metersPerBlock) - 1 + WORLD_Y_SHIFT));
 		EarthClimateService.EffectiveClimate climate = sampleEffectiveClimate(latitude, longitude, elevationMeters);
 		double growth = climate != null ? climate.plantGrowthScore() : 0.0;
 		LocalTerrainAnalysis localTerrain = sampleLocalTerrain(latitude, longitude);
-		BlockState surfaceBlock = pickSurfaceBlock(blockX, blockZ, latitude, climate, localTerrain);
-		boolean supportsVegetation = surfaceBlock == GRASS_BLOCK || surfaceBlock == SNOW_BLOCK;
-		return new SurfaceColumn(surfaceY, surfaceBlock, growth, supportsVegetation);
+		EarthHydroService.LakeSample lake = sampleLakeHydro(latitude, longitude);
+		int adjustedTerrainY = isLakeTile(lake) ? Math.max(this.minY, terrainY - 1) : terrainY;
+		Integer lakeWaterSurfaceY = lakeWaterSurfaceY(adjustedTerrainY, maxY, metersPerBlock, lake);
+		BlockState lakeSurfaceBlock = lakeWaterSurfaceY != null && climate != null && climate.averageTemperature() <= -1.0 ? ICE : WATER;
+		BlockState surfaceBlock = lakeWaterSurfaceY != null || adjustedTerrainY < shiftedSeaLevel()
+			? SAND
+			: pickSurfaceBlock(blockX, blockZ, latitude, climate, localTerrain);
+		boolean supportsVegetation = lakeWaterSurfaceY == null && (surfaceBlock == GRASS_BLOCK || surfaceBlock == SNOW_BLOCK);
+		SurfaceColumn computed = new SurfaceColumn(adjustedTerrainY, surfaceBlock, growth, supportsVegetation, lakeWaterSurfaceY, lakeSurfaceBlock);
+		this.surfaceColumnCache.put(cacheKey, computed);
+		return computed;
+	}
+
+	private SurfaceColumn[] buildChunkSurfaceColumns(int chunkStartX, int chunkStartZ, int maxY) {
+		SurfaceColumn[] columns = new SurfaceColumn[16 * 16];
+		for (int localX = 0; localX < 16; localX++) {
+			for (int localZ = 0; localZ < 16; localZ++) {
+				columns[columnIndex(localX, localZ)] = getSurfaceColumn(chunkStartX + localX, chunkStartZ + localZ, maxY);
+			}
+		}
+		return columns;
+	}
+
+	private int columnIndex(int localX, int localZ) {
+		return localX * 16 + localZ;
 	}
 
 	private double effectiveMetersPerBlock() {
@@ -390,6 +443,12 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		if (surfaceBlock == STONE) {
 			return STONE;
 		}
+		if (surfaceBlock == SAND) {
+			if (y == surfaceY) {
+				return SAND;
+			}
+			return STONE;
+		}
 		if (surfaceBlock == SNOW_BLOCK) {
 			if (y == surfaceY) {
 				return SNOW_BLOCK;
@@ -414,6 +473,32 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		} catch (Exception exception) {
 			return null;
 		}
+	}
+
+	private EarthHydroService.LakeSample sampleLakeHydro(double latitude, double longitude) {
+		try {
+			return EarthHydroService.sampleLakes(latitude, longitude);
+		} catch (Exception exception) {
+			return null;
+		}
+	}
+
+	private Integer lakeWaterSurfaceY(int terrainY, int maxY, double metersPerBlock, EarthHydroService.LakeSample lake) {
+		if (!isLakeTile(lake) || lake.lakeWaterLevelMeters() < 0.0) {
+			return null;
+		}
+
+		int waterSurfaceY = Math.min(maxY, metersToWorldY(lake.lakeWaterLevelMeters(), metersPerBlock, maxY));
+		return terrainY < waterSurfaceY ? waterSurfaceY : null;
+	}
+
+	private boolean isLakeTile(EarthHydroService.LakeSample lake) {
+		return lake != null && lake.lake();
+	}
+
+	private int metersToWorldY(double elevationMeters, double metersPerBlock, int maxY) {
+		int y = (int)Math.round(elevationMeters / metersPerBlock) - 1 + WORLD_Y_SHIFT;
+		return Math.max(this.minY, Math.min(maxY, y));
 	}
 
 	private BlockState pickSurfaceBlock(
@@ -746,7 +831,12 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 	}
 
 	private void placeVineCurtain(StructureWorldAccess world, BlockPos anchorPos, int dx, int dz) {
-		BlockState vineState = Blocks.VINE.getDefaultState().with(VineBlock.UP, true);
+		BlockState vineState = Blocks.VINE.getDefaultState();
+		if (Math.abs(dx) >= Math.abs(dz)) {
+			vineState = vineState.with(dx > 0 ? VineBlock.EAST : VineBlock.WEST, true);
+		} else {
+			vineState = vineState.with(dz > 0 ? VineBlock.SOUTH : VineBlock.NORTH, true);
+		}
 		for (int drop = 1; drop <= 3; drop++) {
 			BlockPos vinePos = anchorPos.down(drop);
 			if (!world.getBlockState(vinePos).isAir()) {
@@ -824,7 +914,17 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		return WORLD_Y_SHIFT;
 	}
 
-	private record SurfaceColumn(int surfaceY, BlockState surfaceBlock, double growth, boolean supportsVegetation) {
+	private record SurfaceColumn(
+		int surfaceY,
+		BlockState surfaceBlock,
+		double growth,
+		boolean supportsVegetation,
+		Integer waterSurfaceY,
+		BlockState lakeSurfaceBlock
+	) {
+	}
+
+	private record SurfaceColumnCacheKey(int blockX, int blockZ, int maxY) {
 	}
 
 	private record LocalTerrainAnalysis(double normalizedSlope, double slopeDegrees, double downhillAspectDegrees) {
