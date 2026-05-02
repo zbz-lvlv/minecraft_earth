@@ -693,6 +693,18 @@ public final class EarthClimateService {
 		);
 	}
 
+	public static double colorTintGrowthScore(double temperatureC, double rainfallMmPerDay) {
+		double temperatureScore = temperaturePlantSuitability(temperatureC);
+		double rainfallScore = rainfallPlantSuitability(rainfallMmPerDay);
+		double limitingFactor = Math.min(temperatureScore, rainfallScore);
+		double weightedBalancedMean = Math.cbrt(temperatureScore * rainfallScore * rainfallScore);
+		return clamp(
+			weightedBalancedMean * (PLANT_LIMITING_FACTOR_FLOOR + (1.0 - PLANT_LIMITING_FACTOR_FLOOR) * limitingFactor),
+			0.0,
+			1.0
+		);
+	}
+
 	private static double monthlyPlantGrowthScore(
 		double latitude,
 		double altitudeDeltaMeters,

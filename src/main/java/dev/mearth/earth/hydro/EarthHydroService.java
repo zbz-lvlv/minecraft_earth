@@ -40,6 +40,7 @@ public final class EarthHydroService {
 	private static final Map<HydroTileKey, CompletableFuture<HydroTile>> IN_FLIGHT = new ConcurrentHashMap<>();
 	private static final Map<HydroFeatureCacheKey, Double> LAKE_LEVEL_CACHE = new ConcurrentHashMap<>();
 	private static final Map<HydroTileKey, LakeRaster> LAKE_RASTER_CACHE = new ConcurrentHashMap<>();
+	private static final Map<HydroTileKey, RiverRaster> RIVER_RASTER_CACHE = new ConcurrentHashMap<>();
 	private static final Path CACHE_DIR = FabricLoader.getInstance().getConfigDir().resolve("earthmod").resolve("hydro");
 	private static final String CACHE_VERSION = "v3";
 	private static final double TILE_SIZE_DEGREES = 0.25;
@@ -48,6 +49,7 @@ public final class EarthHydroService {
 	private static final double EARTH_RADIUS_METERS = 6_371_008.8;
 	private static final int FEATURE_ELEVATION_SAMPLE_LIMIT = 32;
 	private static final int LAKE_RASTER_SIZE = 1024;
+	private static final int RIVER_RASTER_SIZE = 1024;
 	private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(2, runnable -> {
 		Thread thread = new Thread(runnable, "earthmod-hydro");
 		thread.setDaemon(true);
@@ -93,6 +95,25 @@ public final class EarthHydroService {
 		CACHE.put(key, fetched);
 		writeCacheFile(key, fetched);
 		return summarizeLakes(key, fetched, latitude, longitude);
+	}
+
+	public static RiverSample sampleRivers(double latitude, double longitude) throws IOException, InterruptedException {
+		HydroTileKey key = HydroTileKey.from(latitude, longitude);
+		HydroTile cached = CACHE.get(key);
+		if (cached != null) {
+			return summarizeRivers(key, cached, latitude, longitude);
+		}
+
+		HydroTile diskCached = readCacheFile(key);
+		if (diskCached != null) {
+			CACHE.put(key, diskCached);
+			return summarizeRivers(key, diskCached, latitude, longitude);
+		}
+
+		HydroTile fetched = fetchFromApi(key);
+		CACHE.put(key, fetched);
+		writeCacheFile(key, fetched);
+		return summarizeRivers(key, fetched, latitude, longitude);
 	}
 
 	public static HydroSample getCachedOrFetchAsync(double latitude, double longitude) {
@@ -504,6 +525,17 @@ public final class EarthHydroService {
 		);
 	}
 
+	private static RiverSample summarizeRivers(HydroTileKey key, HydroTile tile, double latitude, double longitude) {
+		RiverRaster raster = RIVER_RASTER_CACHE.computeIfAbsent(key, ignored -> buildRiverRaster(key, tile));
+		int cellX = clamp((int)Math.floor((longitude - key.westLongitude()) / TILE_SIZE_DEGREES * raster.width()), 0, raster.width() - 1);
+		int cellY = clamp((int)Math.floor((latitude - key.southLatitude()) / TILE_SIZE_DEGREES * raster.height()), 0, raster.height() - 1);
+		double waterLevelMeters = raster.waterLevelMeters(cellX, cellY);
+		if (!Double.isFinite(waterLevelMeters)) {
+			return new RiverSample(latitude, longitude, false, -1.0);
+		}
+		return new RiverSample(latitude, longitude, true, waterLevelMeters);
+	}
+
 	private static HydroTile readCacheFile(HydroTileKey key) {
 		Path path = cachePath(key);
 		if (!Files.exists(path)) {
@@ -696,6 +728,241 @@ public final class EarthHydroService {
 		return new LakeRaster(LAKE_RASTER_SIZE, LAKE_RASTER_SIZE, featureIndices, List.copyOf(rasterFeatures));
 	}
 
+	private static RiverRaster buildRiverRaster(HydroTileKey key, HydroTile tile) {
+		double[] waterLevels = new double[RIVER_RASTER_SIZE * RIVER_RASTER_SIZE];
+		for (int index = 0; index < waterLevels.length; index++) {
+			waterLevels[index] = Double.NaN;
+		}
+
+		for (HydroFeature feature : tile.features()) {
+			if (!feature.kind().isRiverLike() || feature.points().size() < 2 || feature.area()) {
+				continue;
+			}
+			rasterizeRiverFeature(key, waterLevels, feature);
+		}
+
+		smoothRiverWaterLevels(waterLevels, RIVER_RASTER_SIZE, RIVER_RASTER_SIZE, 2);
+		fillRiverGaps(waterLevels, RIVER_RASTER_SIZE, RIVER_RASTER_SIZE, 2);
+		pruneIsolatedRiverCells(waterLevels, RIVER_RASTER_SIZE, RIVER_RASTER_SIZE, 2);
+		return new RiverRaster(RIVER_RASTER_SIZE, RIVER_RASTER_SIZE, waterLevels);
+	}
+
+	private static void rasterizeRiverFeature(HydroTileKey key, double[] waterLevels, HydroFeature feature) {
+		List<GeoPoint> points = feature.points();
+		double totalLength = totalLengthMeters(points, false);
+		if (totalLength <= 1.0e-6) {
+			return;
+		}
+
+		double startElevation = TerrainTileService.sampleMeters(points.getFirst().latitude(), points.getFirst().longitude());
+		double endElevation = TerrainTileService.sampleMeters(points.getLast().latitude(), points.getLast().longitude());
+		boolean reverseProgress = endElevation > startElevation;
+		double traversedLength = 0.0;
+		double sampleStepMeters = riverRasterSampleStepMeters(key);
+
+		for (int index = 0; index < points.size() - 1; index++) {
+			GeoPoint start = points.get(index);
+			GeoPoint end = points.get(index + 1);
+			double segmentLength = haversineMeters(start, end);
+			int steps = Math.max(1, (int)Math.ceil(segmentLength / sampleStepMeters));
+			for (int step = 0; step <= steps; step++) {
+				double fraction = step / (double)steps;
+				double sampleLatitude = lerp(start.latitude(), end.latitude(), fraction);
+				double sampleLongitude = lerp(start.longitude(), end.longitude(), fraction);
+				double downstreamProgress = (traversedLength + segmentLength * fraction) / totalLength;
+				if (reverseProgress) {
+					downstreamProgress = 1.0 - downstreamProgress;
+				}
+				double halfWidthMeters = riverHalfWidthMeters(feature.kind(), downstreamProgress);
+				double waterLevelMeters = TerrainTileService.sampleMeters(sampleLatitude, sampleLongitude);
+				burnRiverSample(key, waterLevels, sampleLatitude, sampleLongitude, halfWidthMeters, waterLevelMeters);
+			}
+			traversedLength += segmentLength;
+		}
+	}
+
+	private static double riverRasterSampleStepMeters(HydroTileKey key) {
+		double middleLatitude = (key.southLatitude() + key.northLatitude()) * 0.5;
+		double latitudeStepDegrees = TILE_SIZE_DEGREES / RIVER_RASTER_SIZE;
+		double longitudeStepDegrees = TILE_SIZE_DEGREES / RIVER_RASTER_SIZE;
+		double latMetersPerCell = haversineMeters(
+			new GeoPoint(middleLatitude, key.westLongitude()),
+			new GeoPoint(middleLatitude + latitudeStepDegrees, key.westLongitude())
+		);
+		double lonMetersPerCell = haversineMeters(
+			new GeoPoint(middleLatitude, key.westLongitude()),
+			new GeoPoint(middleLatitude, key.westLongitude() + longitudeStepDegrees)
+		);
+		double minCellMeters = Math.max(1.0, Math.min(latMetersPerCell, lonMetersPerCell));
+		return Math.max(6.0, minCellMeters * 0.75);
+	}
+
+	private static void burnRiverSample(
+		HydroTileKey key,
+		double[] waterLevels,
+		double latitude,
+		double longitude,
+		double halfWidthMeters,
+		double waterLevelMeters
+	) {
+		double centerX = (longitude - key.westLongitude()) / TILE_SIZE_DEGREES * RIVER_RASTER_SIZE;
+		double centerY = (latitude - key.southLatitude()) / TILE_SIZE_DEGREES * RIVER_RASTER_SIZE;
+		double latMetersPerCell = haversineMeters(
+			new GeoPoint(latitude, longitude),
+			new GeoPoint(latitude + TILE_SIZE_DEGREES / RIVER_RASTER_SIZE, longitude)
+		);
+		double lonMetersPerCell = haversineMeters(
+			new GeoPoint(latitude, longitude),
+			new GeoPoint(latitude, longitude + TILE_SIZE_DEGREES / RIVER_RASTER_SIZE)
+		);
+		int radiusX = Math.max(1, (int)Math.ceil(halfWidthMeters / Math.max(lonMetersPerCell, 1.0)));
+		int radiusY = Math.max(1, (int)Math.ceil(halfWidthMeters / Math.max(latMetersPerCell, 1.0)));
+		int minX = clamp((int)Math.floor(centerX) - radiusX, 0, RIVER_RASTER_SIZE - 1);
+		int maxX = clamp((int)Math.floor(centerX) + radiusX, 0, RIVER_RASTER_SIZE - 1);
+		int minY = clamp((int)Math.floor(centerY) - radiusY, 0, RIVER_RASTER_SIZE - 1);
+		int maxY = clamp((int)Math.floor(centerY) + radiusY, 0, RIVER_RASTER_SIZE - 1);
+
+		for (int y = minY; y <= maxY; y++) {
+			double normalizedY = ((y + 0.5) - centerY) / Math.max(radiusY, 1);
+			for (int x = minX; x <= maxX; x++) {
+				double normalizedX = ((x + 0.5) - centerX) / Math.max(radiusX, 1);
+				if (normalizedX * normalizedX + normalizedY * normalizedY > 1.0) {
+					continue;
+				}
+				int cellIndex = y * RIVER_RASTER_SIZE + x;
+				double existing = waterLevels[cellIndex];
+				if (!Double.isFinite(existing) || waterLevelMeters < existing) {
+					waterLevels[cellIndex] = waterLevelMeters;
+				}
+			}
+		}
+	}
+
+	private static void smoothRiverWaterLevels(double[] waterLevels, int width, int height, int passes) {
+		double[] scratch = new double[waterLevels.length];
+		for (int pass = 0; pass < passes; pass++) {
+			for (int y = 0; y < height; y++) {
+				for (int x = 0; x < width; x++) {
+					int index = y * width + x;
+					double value = waterLevels[index];
+					if (!Double.isFinite(value)) {
+						scratch[index] = Double.NaN;
+						continue;
+					}
+
+					double total = 0.0;
+					int count = 0;
+					for (int dy = -1; dy <= 1; dy++) {
+						int ny = y + dy;
+						if (ny < 0 || ny >= height) {
+							continue;
+						}
+						for (int dx = -1; dx <= 1; dx++) {
+							int nx = x + dx;
+							if (nx < 0 || nx >= width) {
+								continue;
+							}
+							double neighbor = waterLevels[ny * width + nx];
+							if (!Double.isFinite(neighbor)) {
+								continue;
+							}
+							total += neighbor;
+							count++;
+						}
+					}
+					scratch[index] = count == 0 ? value : total / count;
+				}
+			}
+			System.arraycopy(scratch, 0, waterLevels, 0, waterLevels.length);
+		}
+	}
+
+	private static void fillRiverGaps(double[] waterLevels, int width, int height, int passes) {
+		double[] scratch = waterLevels.clone();
+		for (int pass = 0; pass < passes; pass++) {
+			System.arraycopy(waterLevels, 0, scratch, 0, waterLevels.length);
+			for (int y = 1; y < height - 1; y++) {
+				for (int x = 1; x < width - 1; x++) {
+					int index = y * width + x;
+					if (Double.isFinite(waterLevels[index])) {
+						continue;
+					}
+
+					double left = waterLevels[index - 1];
+					double right = waterLevels[index + 1];
+					double up = waterLevels[index - width];
+					double down = waterLevels[index + width];
+					boolean horizontalBridge = Double.isFinite(left) && Double.isFinite(right);
+					boolean verticalBridge = Double.isFinite(up) && Double.isFinite(down);
+					if (!horizontalBridge && !verticalBridge) {
+						continue;
+					}
+
+					double total = 0.0;
+					int count = 0;
+					if (horizontalBridge) {
+						total += left + right;
+						count += 2;
+					}
+					if (verticalBridge) {
+						total += up + down;
+						count += 2;
+					}
+					scratch[index] = total / count;
+				}
+			}
+			System.arraycopy(scratch, 0, waterLevels, 0, waterLevels.length);
+		}
+	}
+
+	private static void pruneIsolatedRiverCells(double[] waterLevels, int width, int height, int passes) {
+		double[] scratch = waterLevels.clone();
+		for (int pass = 0; pass < passes; pass++) {
+			System.arraycopy(waterLevels, 0, scratch, 0, waterLevels.length);
+			for (int y = 1; y < height - 1; y++) {
+				for (int x = 1; x < width - 1; x++) {
+					int index = y * width + x;
+					if (!Double.isFinite(waterLevels[index])) {
+						continue;
+					}
+
+					int cardinalNeighbors = 0;
+					if (Double.isFinite(waterLevels[index - 1])) {
+						cardinalNeighbors++;
+					}
+					if (Double.isFinite(waterLevels[index + 1])) {
+						cardinalNeighbors++;
+					}
+					if (Double.isFinite(waterLevels[index - width])) {
+						cardinalNeighbors++;
+					}
+					if (Double.isFinite(waterLevels[index + width])) {
+						cardinalNeighbors++;
+					}
+					if (cardinalNeighbors >= 2) {
+						continue;
+					}
+
+					int neighborhoodCount = 0;
+					for (int dy = -1; dy <= 1; dy++) {
+						for (int dx = -1; dx <= 1; dx++) {
+							if (dx == 0 && dy == 0) {
+								continue;
+							}
+							if (Double.isFinite(waterLevels[(y + dy) * width + (x + dx)])) {
+								neighborhoodCount++;
+							}
+						}
+					}
+					if (neighborhoodCount <= 2) {
+						scratch[index] = Double.NaN;
+					}
+				}
+			}
+			System.arraycopy(scratch, 0, waterLevels, 0, waterLevels.length);
+		}
+	}
+
 	private static double sampleRiverWaterLevelMeters(FeatureHit hit) {
 		GeoPoint closestPoint = hit.closestPoint();
 		return TerrainTileService.sampleMeters(closestPoint.latitude(), closestPoint.longitude());
@@ -808,6 +1075,14 @@ public final class EarthHydroService {
 	) {
 	}
 
+	public record RiverSample(
+		double latitude,
+		double longitude,
+		boolean river,
+		double riverWaterLevelMeters
+	) {
+	}
+
 	public enum WaterBodyKind {
 		LAKE,
 		RESERVOIR,
@@ -897,6 +1172,12 @@ public final class EarthHydroService {
 	}
 
 	private record LakeRasterFeature(HydroFeature feature, double waterLevelMeters) {
+	}
+
+	private record RiverRaster(int width, int height, double[] waterLevels) {
+		double waterLevelMeters(int x, int y) {
+			return waterLevels[y * width + x];
+		}
 	}
 
 	private record SegmentProjection(double distanceMeters, double segmentFraction, GeoPoint closestPoint) {

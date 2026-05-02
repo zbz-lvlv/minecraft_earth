@@ -53,6 +53,7 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 	private static final double SNOW_TEMP_NOISE_AMPLITUDE_C = 0.65;
 	private static final double SNOW_BASE_START_C = 1.0;
 	private static final double SNOW_ASPECT_AMPLITUDE_C = 2.5;
+	private static final double MIN_HYDRO_GROWTH = 0.10;
 	private static final double UNDERGROWTH_START_GROWTH = 0.60;
 	private static final double UNDERGROWTH_FULL_GROWTH = 0.80;
 	private static final int SURFACE_COLUMN_CACHE_LIMIT = 32_768;
@@ -61,7 +62,8 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		Codec.DOUBLE.optionalFieldOf("meters_per_block", 25.0).forGetter(EarthChunkGenerator::metersPerBlock),
 		Codec.INT.optionalFieldOf("min_y", -512).forGetter(EarthChunkGenerator::getMinimumY),
 		Codec.INT.optionalFieldOf("world_height", 1024).forGetter(EarthChunkGenerator::getWorldHeight),
-		Codec.INT.optionalFieldOf("sea_level", 0).forGetter(EarthChunkGenerator::getSeaLevel)
+		Codec.INT.optionalFieldOf("sea_level", 0).forGetter(EarthChunkGenerator::getSeaLevel),
+		Codec.BOOL.optionalFieldOf("generate_rivers", true).forGetter(EarthChunkGenerator::generateRivers)
 	).apply(instance, EarthChunkGenerator::new));
 
 	private static final BlockState AIR = Blocks.AIR.getDefaultState();
@@ -85,6 +87,7 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 	private final int minY;
 	private final int worldHeight;
 	private final int seaLevel;
+	private final boolean generateRivers;
 	private final Map<SurfaceColumnCacheKey, SurfaceColumn> surfaceColumnCache = Collections.synchronizedMap(
 		new LinkedHashMap<>(SURFACE_COLUMN_CACHE_LIMIT, 0.75f, true) {
 			@Override
@@ -94,16 +97,28 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		}
 	);
 
-	public EarthChunkGenerator(BiomeSource biomeSource, double metersPerBlock, int minY, int worldHeight, int seaLevel) {
+	public EarthChunkGenerator(BiomeSource biomeSource, double metersPerBlock, int minY, int worldHeight, int seaLevel, boolean generateRivers) {
 		super(biomeSource);
 		this.metersPerBlock = metersPerBlock;
 		this.minY = minY;
 		this.worldHeight = worldHeight;
 		this.seaLevel = seaLevel;
+		this.generateRivers = generateRivers;
 	}
 
 	public double metersPerBlock() {
 		return this.metersPerBlock;
+	}
+
+	public boolean generateRivers() {
+		return this.generateRivers;
+	}
+
+	public EarthChunkGenerator withGenerateRivers(boolean generateRivers) {
+		if (this.generateRivers == generateRivers) {
+			return this;
+		}
+		return new EarthChunkGenerator(this.biomeSource, this.metersPerBlock, this.minY, this.worldHeight, this.seaLevel, generateRivers);
 	}
 
 	public double eastWestMetersPerBlock() {
@@ -308,16 +323,29 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		int terrainY = Math.max(this.minY, Math.min(maxY, (int)Math.round(elevationMeters / metersPerBlock) - 1 + WORLD_Y_SHIFT));
 		EarthClimateService.EffectiveClimate climate = sampleEffectiveClimate(latitude, longitude, elevationMeters);
 		double growth = climate != null ? climate.plantGrowthScore() : 0.0;
+		boolean hydroAllowed = hydroAllowed(growth);
 		LocalTerrainAnalysis localTerrain = sampleLocalTerrain(latitude, longitude);
 		EarthHydroService.LakeSample lake = sampleLakeHydro(latitude, longitude);
-		int adjustedTerrainY = isLakeTile(lake) ? Math.max(this.minY, terrainY - 1) : terrainY;
-		Integer lakeWaterSurfaceY = lakeWaterSurfaceY(adjustedTerrainY, maxY, metersPerBlock, lake);
-		BlockState lakeSurfaceBlock = lakeWaterSurfaceY != null && climate != null && climate.averageTemperature() <= -1.0 ? ICE : WATER;
-		BlockState surfaceBlock = lakeWaterSurfaceY != null || adjustedTerrainY < shiftedSeaLevel()
+		EarthHydroService.RiverSample river = this.generateRivers ? sampleRiverHydro(latitude, longitude) : null;
+		boolean lakeTile = hydroAllowed && isLakeTile(lake);
+		boolean riverTile = hydroAllowed && isRiverTile(river);
+		int adjustedTerrainY = terrainY;
+		if (lakeTile) {
+			adjustedTerrainY = Math.max(this.minY, adjustedTerrainY - 1);
+		}
+		Integer lakeWaterSurfaceY = lakeWaterSurfaceY(adjustedTerrainY, maxY, metersPerBlock, lakeTile ? lake : null);
+		Integer riverWaterSurfaceY = riverWaterSurfaceY(maxY, metersPerBlock, riverTile ? river : null);
+		if (riverTile && riverWaterSurfaceY != null) {
+			adjustedTerrainY = Math.max(this.minY, riverWaterSurfaceY - 1);
+			lakeWaterSurfaceY = lakeWaterSurfaceY(adjustedTerrainY, maxY, metersPerBlock, lakeTile ? lake : null);
+		}
+		Integer inlandWaterSurfaceY = pickInlandWaterSurfaceY(lakeWaterSurfaceY, riverWaterSurfaceY);
+		BlockState inlandWaterBlock = lakeWaterSurfaceY != null && climate != null && climate.averageTemperature() <= -1.0 ? ICE : WATER;
+		BlockState surfaceBlock = inlandWaterSurfaceY != null || adjustedTerrainY < shiftedSeaLevel()
 			? SAND
 			: pickSurfaceBlock(blockX, blockZ, latitude, climate, localTerrain);
-		boolean supportsVegetation = lakeWaterSurfaceY == null && (surfaceBlock == GRASS_BLOCK || surfaceBlock == SNOW_BLOCK);
-		SurfaceColumn computed = new SurfaceColumn(adjustedTerrainY, surfaceBlock, growth, supportsVegetation, lakeWaterSurfaceY, lakeSurfaceBlock);
+		boolean supportsVegetation = inlandWaterSurfaceY == null && (surfaceBlock == GRASS_BLOCK || surfaceBlock == SNOW_BLOCK);
+		SurfaceColumn computed = new SurfaceColumn(adjustedTerrainY, surfaceBlock, growth, supportsVegetation, inlandWaterSurfaceY, inlandWaterBlock);
 		this.surfaceColumnCache.put(cacheKey, computed);
 		return computed;
 	}
@@ -483,6 +511,14 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 		}
 	}
 
+	private EarthHydroService.RiverSample sampleRiverHydro(double latitude, double longitude) {
+		try {
+			return EarthHydroService.sampleRivers(latitude, longitude);
+		} catch (Exception exception) {
+			return null;
+		}
+	}
+
 	private Integer lakeWaterSurfaceY(int terrainY, int maxY, double metersPerBlock, EarthHydroService.LakeSample lake) {
 		if (!isLakeTile(lake) || lake.lakeWaterLevelMeters() < 0.0) {
 			return null;
@@ -490,6 +526,29 @@ public final class EarthChunkGenerator extends ChunkGenerator {
 
 		int waterSurfaceY = Math.min(maxY, metersToWorldY(lake.lakeWaterLevelMeters(), metersPerBlock, maxY));
 		return terrainY < waterSurfaceY ? waterSurfaceY : null;
+	}
+
+	private Integer riverWaterSurfaceY(int maxY, double metersPerBlock, EarthHydroService.RiverSample river) {
+		if (!isRiverTile(river) || river.riverWaterLevelMeters() < 0.0) {
+			return null;
+		}
+
+		return Math.min(maxY, metersToWorldY(river.riverWaterLevelMeters(), metersPerBlock, maxY));
+	}
+
+	private boolean isRiverTile(EarthHydroService.RiverSample river) {
+		return river != null && river.river();
+	}
+
+	private boolean hydroAllowed(double growth) {
+		return growth >= MIN_HYDRO_GROWTH;
+	}
+
+	private Integer pickInlandWaterSurfaceY(Integer lakeWaterSurfaceY, Integer riverWaterSurfaceY) {
+		if (lakeWaterSurfaceY != null) {
+			return lakeWaterSurfaceY;
+		}
+		return riverWaterSurfaceY;
 	}
 
 	private boolean isLakeTile(EarthHydroService.LakeSample lake) {

@@ -11,7 +11,8 @@
 				"meters_per_block": 25.0,
 				"min_y": -512,
 				"world_height": 1024,
-				"sea_level": 0
+				"sea_level": 0,
+				"generate_rivers": true
 			}
 		},
 		"minecraft:the_nether": {

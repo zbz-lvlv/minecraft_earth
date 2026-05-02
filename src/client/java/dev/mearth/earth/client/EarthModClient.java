@@ -21,7 +21,7 @@ public final class EarthModClient implements ClientModInitializer {
 	private static final double DRY_GROWTH_THRESHOLD = 0.18;
 	private static final double MIN_COLOR_GROWTH_THRESHOLD = 0.48;
 	private static final double LUSH_GROWTH_THRESHOLD = 0.68;
-	private static final int DRY_GRASS_COLOR = 0xf5c958;
+	private static final int DRY_GRASS_COLOR = 0xfae8c0;
 	private static final int LUSH_GRASS_COLOR = 0x3f822f;
 	private static final int DEFAULT_GRASS_COLOR = 0x91BD59;
 	private static final ConcurrentHashMap<Long, Integer> GRASS_COLOR_CACHE = new ConcurrentHashMap<>();
@@ -86,7 +86,11 @@ public final class EarthModClient implements ClientModInitializer {
 				EarthChunkGenerator.climateStartYear(),
 				EarthChunkGenerator.climateEndYear()
 			);
-			return leafTint ? colorForLeafGrowth(climate.plantGrowthScore()) : colorForGrassGrowth(climate.plantGrowthScore());
+			double tintGrowth = EarthClimateService.colorTintGrowthScore(
+				climate.averageTemperature(),
+				climate.averageRainfall()
+			);
+			return leafTint ? colorForLeafGrowth(tintGrowth) : colorForGrassGrowth(tintGrowth);
 		} catch (Exception ignored) {
 			return DEFAULT_GRASS_COLOR;
 		}
